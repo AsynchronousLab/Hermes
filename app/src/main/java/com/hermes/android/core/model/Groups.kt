@@ -4,6 +4,8 @@ import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 
 /**
  * Group ("room") contracts.
@@ -147,13 +149,19 @@ data class RoomEvent(
     @SerialName("created_at") val createdAt: Double? = null,
     val idempotent: Boolean? = null,
 ) {
-    /** Best-effort body text; falls back to the raw payload when not textual. */
+    /**
+     * Best-effort body text; falls back to the raw payload when not textual.
+     *
+     * Read via [JsonPrimitive.contentOrNull]: `toString()` on the element
+     * yields the *JSON literal* — quotes and all — so trimming the edge quotes
+     * still left `\n`, `\"` and `\\` escaped in the transcript, and a `null`
+     * literal decoded as the string "null".
+     */
     fun displayText(): String? {
         val p = payload ?: return null
-        p["text"]?.let { return it.toString().trim('"').takeIf(String::isNotBlank) }
-        p["message"]?.let { return it.toString().trim('"').takeIf(String::isNotBlank) }
-        p["name"]?.let { return it.toString().trim('"').takeIf(String::isNotBlank) }
-        return null
+        fun field(name: String): String? =
+            (p[name] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }
+        return field("text") ?: field("message") ?: field("name")
     }
 }
 
