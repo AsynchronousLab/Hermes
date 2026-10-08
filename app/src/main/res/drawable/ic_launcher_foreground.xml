@@ -1,0 +1,13 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Hex mark echoing the Hermes cartouche, centred in the 72dp adaptive safe zone. -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,30 L74,42 L74,66 L54,78 L34,66 L34,42 Z" />
+    <path
+        android:fillColor="#0F5BFF"
+        android:pathData="M54,41 L65,47.5 L65,60.5 L54,67 L43,60.5 L43,47.5 Z" />
+</vector>

@@ -1,0 +1,41 @@
+# Local Android toolchain
+.toolchain/
+
+# Gradle / Android
+.gradle/
+.kotlin/
+build/
+local.properties
+*.apk
+*.aab
+
+# Build logs
+build*.log
+
+# Local Dashboard probes and debugging scripts
+/tools/
+t1.bin
+t2.bin
+t3.bin
+
+# Local credentials
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+
+# IDE
+.idea/
+*.iml
+.DS_Store
+captures/
+
+# Emulator screenshots
+emu_shot*.png
+
+# Review artefacts
+review*.txt
+review*.md
+REPORT*.md

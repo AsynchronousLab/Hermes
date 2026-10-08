@@ -1,0 +1,11 @@
+# Gradle wrapper line endings.
+#
+# This repository is developed on Windows with `core.autocrlf=true`, which
+# would hand every Windows clone a CRLF `gradlew`. A shell script with CRLF
+# fails under sh/bash/WSL with `\r: command not found`, so the wrapper needs
+# explicit endings rather than the checkout default.
+gradlew text eol=lf
+*.bat text eol=crlf
+
+# Everything else is left to core.autocrlf for now; normalising the whole tree
+# is a separate, reviewable change.

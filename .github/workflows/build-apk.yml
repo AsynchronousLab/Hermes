@@ -1,0 +1,159 @@
+name: Build APK
+
+# Builds the debug APK on GitHub's own runners and attaches it to the release.
+#
+# Why this exists: uploading a ~58 MB asset from a workstation means holding one
+# connection open for minutes, and any drop in between makes the upload endpoint
+# fail outright. From a GitHub runner the transfer is internal, so it is both
+# faster and far more reliable. The asset is replaced with --clobber, so this is
+# safe to re-run.
+#
+# Manual run: Actions -> Build APK -> Run workflow. Leave "tag" empty to just
+# produce the artifact without touching any release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to attach the APK to (empty = build only)'
+        required: false
+        type: string
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag != '' && format('refs/tags/{0}', inputs.tag) || github.ref }}
+          fetch-depth: 0
+
+      # An older release tag may predate these helpers. Read them from the
+      # workflow revision, while keeping the app checkout at the release tag.
+      - name: Checkout build helpers
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-tools
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /.github/scripts/prepare_ci_gradle.py
+            /.github/scripts/verify_release_source.sh
+            /.github/scripts/write_release_notes.py
+            /.github/scripts/tests/test_ci_build.py
+            /gradle/wrapper/gradle-wrapper.properties
+
+      - name: Verify release source
+        if: startsWith(github.ref, 'refs/tags/') || inputs.tag != ''
+        env:
+          TAG: ${{ inputs.tag != '' && inputs.tag || github.ref_name }}
+        run: bash .ci-tools/.github/scripts/verify_release_source.sh "$TAG"
+
+      - name: Test CI build helpers
+        run: python3 -m unittest discover -s .ci-tools/.github/scripts/tests -v
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      # The committed wrapper points at a Tencent Cloud mirror, which was chosen
+      # because services.gradle.org stalls on networks inside China. The runners
+      # are outside that context, so use the canonical host here. This only
+      # edits the checked-out copy, never the committed file.
+      - name: Use the canonical Gradle distribution on CI
+        run: |
+          python3 .ci-tools/.github/scripts/prepare_ci_gradle.py
+          grep distributionUrl gradle/wrapper/gradle-wrapper.properties
+
+      # Best effort, never fatal. The runner image normally ships platforms and
+      # build-tools already, and the build step reports the truth if they are
+      # actually missing. What matters here is printing what is available.
+      - name: Ensure Android SDK packages
+        run: |
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-unset}"
+          echo "ANDROID_HOME=${ANDROID_HOME:-unset}"
+          SDKMANAGER="$(command -v sdkmanager || true)"
+          if [ -z "$SDKMANAGER" ]; then
+            for c in "${ANDROID_SDK_ROOT:-}/cmdline-tools/latest/bin/sdkmanager" \
+                     "${ANDROID_HOME:-}/cmdline-tools/latest/bin/sdkmanager" \
+                     "${ANDROID_SDK_ROOT:-}/.github/scripts/bin/sdkmanager"; do
+              if [ -x "$c" ]; then SDKMANAGER="$c"; break; fi
+            done
+          fi
+          echo "sdkmanager: ${SDKMANAGER:-NOT FOUND}"
+          if [ -n "$SDKMANAGER" ]; then
+            yes 2>/dev/null | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+            "$SDKMANAGER" "platform-tools" "platforms;android-35" "build-tools;35.0.0" \
+              || echo "::warning::sdkmanager install failed, using the preinstalled SDK"
+          else
+            echo "::warning::no sdkmanager on PATH, using the preinstalled SDK"
+          fi
+          echo '--- installed platforms ---'; ls "${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}/platforms" 2>/dev/null || true
+          echo '--- installed build-tools ---'; ls "${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}/build-tools" 2>/dev/null || true
+
+      # The index now records gradlew as 100755, but a checkout that ignores
+      # file modes would still leave it unexecutable, so make it explicit.
+      - name: Show Gradle and Java versions
+        run: |
+          chmod +x gradlew
+          java -version
+          ./gradlew --version
+
+      - name: Test and build debug APK
+        run: ./gradlew :app:testDebugUnitTest :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Report the artifact
+        run: |
+          # Publish it as Hermes.apk, not Gradle's app-debug.apk, so the asset
+          # name is stable across runs and --clobber actually replaces it.
+          cp app/build/outputs/apk/debug/app-debug.apk Hermes.apk
+          ls -l Hermes.apk
+          sha256sum Hermes.apk
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          AAPT2="$(ls "$SDK"/build-tools/*/aapt2 2>/dev/null | head -n 1 || true)"
+          if [ -n "$AAPT2" ] && [ -x "$AAPT2" ]; then
+            "$AAPT2" dump badging Hermes.apk | head -n 1
+          else
+            echo "aapt2 not found under $SDK/build-tools, skipping badging dump"
+          fi
+
+      - name: Upload APK as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Hermes.apk
+          path: Hermes.apk
+          if-no-files-found: error
+
+      - name: Attach the APK to the release
+        if: startsWith(github.ref, 'refs/tags/') || inputs.tag != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag != '' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          bash .ci-tools/.github/scripts/verify_release_source.sh "$TAG"
+          python3 .ci-tools/.github/scripts/write_release_notes.py Hermes.apk RELEASE_NOTES.md "$TAG"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG does not exist yet - creating it"
+            gh release create "$TAG" --verify-tag --title "Hermes Android ${TAG#v}" --notes-file RELEASE_NOTES.md
+          fi
+          # Drop any asset left over from an earlier naming scheme, otherwise the
+          # release ends up carrying two near-identical APKs.
+          for stale in app-debug.apk; do
+            gh release delete-asset "$TAG" "$stale" --yes 2>/dev/null \
+              || echo "no stale asset named $stale"
+          done
+          gh release upload "$TAG" Hermes.apk --clobber
+          gh release edit "$TAG" --title "Hermes Android ${TAG#v}" --prerelease=false --latest --notes-file RELEASE_NOTES.md
+          echo "attached to $TAG"
+
