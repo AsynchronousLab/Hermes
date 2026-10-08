@@ -140,8 +140,8 @@ class SessionListViewModel(
         _state.update { it.copy(refreshing = !silent && !it.loading, error = null, needsSetup = false) }
         // Rooms join the same list. A gateway without group support answers
         // `groups.list` with an error, which must not take the whole list down.
-        runCatching { repo.listGroups() }.onSuccess { res ->
-            _state.update { it.copy(rooms = res.rooms) }
+        runCatching { repo.listAllGroups() }.onSuccess { rooms ->
+            _state.update { it.copy(rooms = rooms) }
         }
         runCatching { repo.listSessions() }.fold(
             onSuccess = { list ->

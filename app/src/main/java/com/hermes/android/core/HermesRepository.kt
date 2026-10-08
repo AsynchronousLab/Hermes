@@ -8,7 +8,9 @@ import com.hermes.android.core.net.HermesRest
 import com.hermes.android.core.net.JsonRpcClient
 import com.hermes.android.core.net.SessionCookieJar
 import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.JsonObject
@@ -57,14 +59,26 @@ class HermesRepository {
      */
     @Volatile private var authEpoch = 0L
 
+    private val _configEpoch = MutableStateFlow(0L)
+
     /**
- * Swaps in a new backend.
- *
- * Changing the address must invalidate the live socket too: REST would start
- * using the new host while RPC kept publishing to the old one, so a message
- * sent after a switch could still land on the previous backend.
- */
-suspend fun updateConfig(cfg: HermesConfig) {
+     * Rises whenever the backend or account changes.
+     *
+     * `updateConfig` clears cookies and the socket, but every screen keeps its
+     * own caches (contacts, skills, rooms, tool sessions). They watch this
+     * counter and drop what they hold, so a new account never reads — or sends
+     * against — the previous one's data.
+     */
+    val configEpoch: StateFlow<Long> = _configEpoch.asStateFlow()
+
+    /**
+     * Swaps in a new backend.
+     *
+     * Changing the address must invalidate the live socket too: REST would start
+     * using the new host while RPC kept publishing to the old one, so a message
+     * sent after a switch could still land on the previous backend.
+     */
+    suspend fun updateConfig(cfg: HermesConfig) {
         val changed = cfg.normalizedBaseUrl != config.normalizedBaseUrl ||
             cfg.username != config.username
         config = cfg
@@ -77,6 +91,7 @@ suspend fun updateConfig(cfg: HermesConfig) {
             }
             jar.clear()
             rpc.disconnect()
+            _configEpoch.value++
         }
     }
 
@@ -231,12 +246,19 @@ suspend fun updateConfig(cfg: HermesConfig) {
             return ConnectionTestResult.Failed("测试期间配置已变更或已取消连接，请重试")
         }
 
-        val ticket = auth.wsTicket(config).getOrElse {
+        val ticket = auth.wsTicket(cfg).getOrElse {
             return ConnectionTestResult.Failed("获取 WS 票据失败: ${HermesAuth.describeNetworkError(it)}")
+        }
+        // The ticket round-trip is exactly where a saved config switch lands.
+        // Everything below must describe the config the test *started* with —
+        // using the live global one force-connected whatever was saved
+        // mid-test and reported a mixed result.
+        if (myCancel != cancelEpoch) {
+            return ConnectionTestResult.Failed("测试期间配置已变更或已取消连接，请重试")
         }
 
         val ping = runCatching {
-            rpc.connect(config, force = true)
+            rpc.connect(cfg, force = true)
             var waited = 0
             while (!rpc.isConnected && waited < 8_000) {
                 kotlinx.coroutines.delay(150)
@@ -249,6 +271,11 @@ suspend fun updateConfig(cfg: HermesConfig) {
             return ConnectionTestResult.Failed("WebSocket 失败: ${HermesAuth.describeNetworkError(it)}")
         }
 
+        // `me()` rides the REST client, which reads the live global config — a
+        // switch since the ping would mix two backends into one result.
+        if (myCancel != cancelEpoch) {
+            return ConnectionTestResult.Failed("测试期间配置已变更，结果已丢弃")
+        }
         val me = me().getOrNull()
         return ConnectionTestResult.Success(
             httpMs = httpMs,
@@ -516,6 +543,26 @@ suspend fun updateConfig(cfg: HermesConfig) {
         )
 
     /**
+     * Every group room, following `groups.list`'s `next_offset` cursor.
+     *
+     * The request side takes a plain integer `offset` (probed live), so the
+     * cursor is only followed while it parses as a number that moves forward;
+     * an opaque or repeating cursor stops the walk after the current page
+     * rather than guessing. Bounded so a server that always answers the same
+     * cursor cannot spin the caller.
+     */
+    suspend fun listAllGroups(limit: Int = 50, maxPages: Int = 20): List<Group> {
+        val rooms = mutableListOf<Group>()
+        var offset = 0
+        repeat(maxPages) {
+            val res = listGroups(limit, offset)
+            rooms += res.rooms
+            offset = nextGroupPage(offset, res.rooms, res.nextOffset) ?: return rooms
+        }
+        return rooms
+    }
+
+    /**
      * Creates a group from the chosen profiles.
      *
      * The gateway requires a caller-supplied `room_id`, a name, and 2–6 members
@@ -687,6 +734,20 @@ suspend fun updateConfig(cfg: HermesConfig) {
 }
 
 data class CommandEntry(val name: String, val description: String)
+
+/**
+ * The next `groups.list` page offset, or null when the walk should stop.
+ *
+ * Stops on an empty page (nothing more to fetch), on a cursor that is not a
+ * plain forward-moving integer (opaque cursors cannot be fed to the integer
+ * `offset` parameter), and on one that does not advance (a server bug that
+ * would otherwise loop forever).
+ */
+internal fun nextGroupPage(currentOffset: Int, rooms: List<Group>, nextOffset: String?): Int? =
+    when {
+        rooms.isEmpty() -> null
+        else -> nextOffset?.trim()?.toIntOrNull()?.takeIf { it > currentOffset }
+    }
 
 enum class AttachmentKind { IMAGE, PDF, FILE }
 
