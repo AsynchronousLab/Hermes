@@ -28,6 +28,11 @@ data class RoomUiState(
     val supported: Boolean? = null,
     val error: String? = null,
     val notice: String? = null,
+    /**
+     * Text handed back to the composer after a refused or definitively-failed
+     * send, so a retry is one tap instead of a retype. Cleared once applied.
+     */
+    val restoreDraft: String? = null,
 )
 
 /**
@@ -55,6 +60,8 @@ class RoomChatViewModel(
      * parameter.
      */
     private val selfProfile: String,
+    /** Poll cadence; overridable so behaviour tests can run polls in milliseconds. */
+    private val pollIntervalMs: Long = POLL_INTERVAL_MS,
 ) : ViewModel() {
 
     private val _state = MutableStateFlow(RoomUiState())
@@ -69,10 +76,13 @@ class RoomChatViewModel(
         viewModelScope.launch {
             when (val caps = runCatching { repo.groupCapabilities() }.getOrNull()) {
                 null -> {
-                    _state.update {
-                        it.copy(supported = false, error = "网关不支持群聊（groups.capabilities 不可用）")
-                    }
-                    return@launch
+                    // A failed probe is a transport hiccup, not a verdict on
+                    // the gateway: the room still loads and polls, sending
+                    // stays enabled (a truly unsupported gateway answers the
+                    // send itself, loudly), and the poll re-probes until it
+                    // resolves. Hard-failing here left a spinner forever and
+                    // no way into the room.
+                    _state.update { it.copy(supported = null, error = PROBE_ERROR) }
                 }
                 else -> {
                     val hasSend = caps.methods.contains("groups.send")
@@ -159,20 +169,56 @@ class RoomChatViewModel(
     private fun startPolling() {
         pollJob?.cancel()
         pollJob = viewModelScope.launch {
+            var tick = 0
             while (true) {
-                delay(POLL_INTERVAL_MS)
+                delay(pollIntervalMs)
                 if (_state.value.sending) continue
+                if (_state.value.supported == null) probeCapabilities()
+                // The log page says nothing about the room around it: without
+                // this, a hold, a block, a resume or an outside rename never
+                // reached the header after the first load.
+                if (++tick % STATE_REFRESH_POLLS == 0) refreshRoomState()
                 drain()
             }
         }
     }
 
-    fun send(text: String) {
+    /** Re-probes `groups.send` support; a transient failure stays "unknown". */
+    private suspend fun probeCapabilities() {
+        val caps = runCatching { repo.groupCapabilities() }.getOrNull() ?: return
+        val hasSend = caps.methods.contains("groups.send")
+        _state.update { s ->
+            s.copy(
+                supported = hasSend,
+                error = when {
+                    !hasSend -> "网关未提供 groups.send，只能查看"
+                    s.error == PROBE_ERROR -> null
+                    else -> s.error
+                },
+            )
+        }
+    }
+
+    private suspend fun refreshRoomState() {
+        val st = runCatching { repo.groupState(roomId) }.getOrNull() ?: return
+        _state.update { s -> s.copy(room = st.room, driver = st.driverStatus) }
+    }
+
+    /**
+     * Accepts the draft, or reports false so the composer can keep it.
+     *
+     * The sync guards (empty, busy, read-only room) return false and the draft
+     * survives untouched. An async refusal or definitive failure removes the
+     * echo but hands the text back via [RoomUiState.restoreDraft] — a refused
+     * post used to vanish from both the transcript and the composer, so a long
+     * message had to be retyped from scratch.
+     */
+    fun send(text: String): Boolean {
         val trimmed = text.trim()
-        if (trimmed.isEmpty() || _state.value.sending) return
+        if (trimmed.isEmpty() || _state.value.sending) return false
         if (_state.value.supported == false) {
             _state.update { it.copy(error = "网关未提供 groups.send，只能查看") }
-            return
+            return false
         }
         // One logical post, one idempotency key, minted before the first wire
         // attempt and held on the echo so every retry of this post reuses it.
@@ -197,6 +243,7 @@ class RoomChatViewModel(
             )
         }
         viewModelScope.launch { dispatchSend(echoKey, trimmed, eventId) }
+        return true
     }
 
     /**
@@ -230,7 +277,7 @@ class RoomChatViewModel(
     /** One wire attempt and every way it can settle the echo. */
     private suspend fun dispatchSend(echoKey: String, text: String, eventId: String) {
         runCatching { repo.sendToGroup(roomId, selfProfile, text, MAIN_THREAD_ID, eventId) }
-            .onSuccess { sent -> settleSend(echoKey, sent) }
+            .onSuccess { sent -> settleSend(echoKey, text, sent) }
             .onFailure { t ->
                 if (isUnknownOutcome(t)) {
                     // The post may already be in the log. The gateway cannot
@@ -249,11 +296,14 @@ class RoomChatViewModel(
                     }
                 } else {
                     // Definitive: the gateway answered "no", or the frame
-                    // never left the phone. Nothing was delivered.
+                    // never left the phone. Nothing was delivered, so the
+                    // words go back to the composer instead of vanishing with
+                    // the echo.
                     _state.update { s ->
                         s.copy(
                             sending = false,
                             error = "发送失败：${t.friendly()}",
+                            restoreDraft = text,
                             messages = s.messages.filterNot { m -> m.key == echoKey },
                         )
                     }
@@ -261,7 +311,7 @@ class RoomChatViewModel(
             }
     }
 
-    private fun settleSend(echoKey: String, sent: GroupSendResult) {
+    private fun settleSend(echoKey: String, text: String, sent: GroupSendResult) {
         // `groups.send` answers with the authoritative event, so the echo can
         // be settled right here instead of waiting for the poll to notice a
         // matching row. The event we *sent* is not the key the log uses — the
@@ -285,6 +335,9 @@ class RoomChatViewModel(
             s.copy(
                 sending = false,
                 error = if (refused) refusalReason(sent) else s.error,
+                // A refusal never reached the room: give the words back rather
+                // than deleting them from both the transcript and the composer.
+                restoreDraft = if (refused) text else s.restoreDraft,
                 messages = messages,
             )
         }
@@ -312,6 +365,9 @@ class RoomChatViewModel(
     fun clearNotice() = _state.update { it.copy(notice = null) }
     fun clearError() = _state.update { it.copy(error = null) }
 
+    /** The composer applied a restored draft; drop the hand-off copy. */
+    fun consumeRestoreDraft() = _state.update { it.copy(restoreDraft = null) }
+
     override fun onCleared() {
         pollJob?.cancel()
         super.onCleared()
@@ -329,6 +385,12 @@ class RoomChatViewModel(
 
     private companion object {
         const val POLL_INTERVAL_MS = 2_500L
+
+        /** Room state (driver, name, members) refresh cadence, in polls. */
+        const val STATE_REFRESH_POLLS = 4
+
+        /** Banner shown while the capability probe is failing transitively. */
+        const val PROBE_ERROR = "能力探测失败，稍后自动重试"
 
         /** `actor.kind` values, captured from a live room's log. */
         const val ACTOR_USER = "user"

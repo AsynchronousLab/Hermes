@@ -10,6 +10,7 @@ import com.hermes.android.ui.chat.friendly
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -64,6 +65,26 @@ class ToolsViewModel(
 
     init {
         load(ToolsUiState.Tab.SKILLS)
+        // An account/backend switch invalidates everything cached here: the
+        // session id belongs to the old backend, and the lists are the old
+        // account's. Drop both and reload rather than showing stale data.
+        viewModelScope.launch {
+            repo.configEpoch.drop(1).collect {
+                cachedSessionId = null
+                _state.update {
+                    it.copy(
+                        skills = emptyList(),
+                        toolsets = emptyList(),
+                        files = emptyList(),
+                        cron = emptyList(),
+                        contacts = emptyList(),
+                        agents = emptyList(),
+                        skillDetail = null,
+                    )
+                }
+                load(_state.value.tab)
+            }
+        }
     }
 
     fun selectTab(tab: ToolsUiState.Tab) {
@@ -104,17 +125,26 @@ class ToolsViewModel(
         _state.update { it.copy(loading = false) }
     }
 
+    /** Monotonic request version: only the newest browse may write state. */
+    private var browseSeq = 0L
+
     fun browse(path: String) {
+        val mySeq = ++browseSeq
         _state.update { it.copy(filePath = path) }
         viewModelScope.launch {
             _state.update { it.copy(loading = true) }
             runCatching { repo.listFiles(path) }.fold(
                 onSuccess = { l ->
-                    _state.update { it.updateFiles(l) }
+                    // Rapid browsing starts several listings; a late older
+                    // response used to switch the path and files back to a
+                    // directory the user already left.
+                    if (mySeq == browseSeq) {
+                        _state.update { it.updateFiles(l) }
+                    }
                 },
-                onFailure = { t -> _state.update { it.copy(error = t.friendly()) } },
+                onFailure = { t -> if (mySeq == browseSeq) _state.update { it.copy(error = t.friendly()) } },
             )
-            _state.update { it.copy(loading = false) }
+            if (mySeq == browseSeq) _state.update { it.copy(loading = false) }
         }
     }
 
@@ -149,7 +179,11 @@ class ToolsViewModel(
 
     private suspend fun ensureSession(): String {
         cachedSessionId?.let { return it }
-        val last = runCatching { settings.lastSessionId.first() }.getOrNull()
+        // `session.resume` wants the durable stored id; `lastSessionId` is the
+        // runtime one, which the gateway rejects — the silent createSession()
+        // fallback then applied tool toggles to a session the user was never
+        // in.
+        val last = runCatching { settings.lastStoredSessionId.first() }.getOrNull()
         val resumed = if (!last.isNullOrBlank()) {
             runCatching { repo.resumeSession(last) }.getOrNull()
         } else null

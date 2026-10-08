@@ -260,6 +260,7 @@ fun HermesAppRoot() {
                     onRetry = vm::retry,
                     onHold = vm::hold,
                     onDismiss = { vm.clearError(); vm.clearNotice() },
+                    onConsumeRestoredDraft = vm::consumeRestoreDraft,
                 )
             }
         }
@@ -318,5 +319,6 @@ private fun ChatRoute(
         onSpeak = { speaker.speak(it) },
         onRequestResponse = vm::respondToRequest,
         onReadError = vm::showError,
+        onConsumeRestoredDraft = vm::consumeRestoreDraft,
     )
 }

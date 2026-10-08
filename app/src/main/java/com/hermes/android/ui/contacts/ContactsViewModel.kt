@@ -13,6 +13,7 @@ import com.hermes.android.ui.chat.friendly
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.util.Locale
@@ -48,6 +49,15 @@ class ContactsViewModel(
 
     init {
         refresh()
+        // An account/backend switch means the profiles and rooms on screen are
+        // someone else's: drop them and reload instead of letting the new
+        // account read the old one's contact list.
+        viewModelScope.launch {
+            repo.configEpoch.drop(1).collect {
+                _state.update { it.copy(profiles = emptyList(), groups = emptyList()) }
+                refresh()
+            }
+        }
     }
 
     fun selectTab(tab: ContactsUiState.Tab) {
@@ -68,8 +78,8 @@ class ContactsViewModel(
         }.onFailure { t ->
             _state.update { it.copy(error = "读取联系人失败：${t.friendly()}") }
         }
-        runCatching { repo.listGroups() }.onSuccess { res ->
-            _state.update { it.copy(groups = res.rooms) }
+        runCatching { repo.listAllGroups() }.onSuccess { rooms ->
+            _state.update { it.copy(groups = rooms) }
         }.onFailure { t ->
             _state.update { it.copy(error = "读取群组失败：${t.friendly()}") }
         }

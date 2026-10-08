@@ -43,10 +43,11 @@ import com.hermes.android.ui.markdown.MarkdownText
 fun RoomChatScreen(
     state: RoomUiState,
     onBack: () -> Unit,
-    onSend: (String) -> Unit,
+    onSend: (String) -> Boolean,
     onRetry: (String) -> Unit,
     onHold: () -> Unit,
     onDismiss: () -> Unit,
+    onConsumeRestoredDraft: () -> Unit,
 ) {
     val listState = rememberLazyListState()
 
@@ -148,11 +149,14 @@ fun RoomChatScreen(
             state.notice?.let { RoomBanner(it, isError = false, onDismiss = onDismiss) }
 
             when {
-                state.loading -> Box(Modifier.fillMaxSize(), Alignment.Center) {
+                // weight(1f), not fillMaxSize(): a fillMaxSize child eats the
+                // whole Column and leaves the composer with no height at all,
+                // so an empty (or still-loading) room had no input box.
+                state.loading -> Box(Modifier.weight(1f).fillMaxWidth(), Alignment.Center) {
                     CircularProgressIndicator()
                 }
 
-                state.messages.isEmpty() -> Box(Modifier.fillMaxSize(), Alignment.Center) {
+                state.messages.isEmpty() -> Box(Modifier.weight(1f).fillMaxWidth(), Alignment.Center) {
                     Text(
                         "还没有消息，说点什么吧",
                         style = MaterialTheme.typography.bodyMedium,
@@ -173,6 +177,8 @@ fun RoomChatScreen(
             RoomComposer(
                 enabled = state.supported != false && !state.sending,
                 sending = state.sending,
+                restore = state.restoreDraft,
+                onRestoreConsumed = onConsumeRestoredDraft,
                 onSend = onSend,
             )
         }
@@ -275,8 +281,22 @@ private fun RoomRow(m: RoomMessage, onRetry: (String) -> Unit) {
 }
 
 @Composable
-private fun RoomComposer(enabled: Boolean, sending: Boolean, onSend: (String) -> Unit) {
+private fun RoomComposer(
+    enabled: Boolean,
+    sending: Boolean,
+    restore: String?,
+    onRestoreConsumed: () -> Unit,
+    onSend: (String) -> Boolean,
+) {
     var draft by remember { mutableStateOf("") }
+    // A refused or definitively-failed send hands the text back: retry is one
+    // tap instead of a retype.
+    LaunchedEffect(restore) {
+        if (restore != null) {
+            draft = restore
+            onRestoreConsumed()
+        }
+    }
     HorizontalDivider(thickness = 0.5.dp, color = MaterialTheme.colorScheme.outlineVariant)
     Row(
         Modifier.fillMaxWidth().padding(10.dp),
@@ -300,8 +320,9 @@ private fun RoomComposer(enabled: Boolean, sending: Boolean, onSend: (String) ->
         } else {
             IconButton(
                 onClick = {
-                    onSend(draft)
-                    draft = ""
+                    // Only clear once the ViewModel accepted the draft, so a
+                    // busy or read-only room does not silently swallow it.
+                    if (onSend(draft)) draft = ""
                 },
                 enabled = enabled && draft.isNotBlank(),
             ) {

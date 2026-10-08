@@ -133,8 +133,28 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
         viewModelScope.launch {
             val reasoningWire = runCatching { settings.reasoningLevel.first() }.getOrNull()
             _state.update { it.copy(reasoning = ReasoningLevel.from(reasoningWire)) }
-            openSession()
+            openSessionWhenConnected()
             loadAuxiliary()
+        }
+    }
+
+    /** In-flight session opens, single-slot: the initial open and every recovery retry share it. */
+    private var openJob: Job? = null
+
+    /**
+     * Opens the session once a connection exists.
+     *
+     * A process-death restore lands here before anything has connected:
+     * creating a session over a dead socket failed once and left the screen
+     * dead for good, because the recovery path saw `sessionId == null` and
+     * returned instead of retrying. Waiting for the link (and retrying on
+     * every later recovery) keeps the screen alive.
+     */
+    private fun openSessionWhenConnected() {
+        if (openJob?.isActive == true) return
+        openJob = viewModelScope.launch {
+            repo.connection.first { it == RpcConnectionState.Connected }
+            openSession()
         }
     }
 
@@ -167,7 +187,14 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
      * bubble would sit on "正在输入" for the rest of the process lifetime.
      */
     private fun onReconnected() {
-        val sid = _state.value.sessionId ?: return
+        val sid = _state.value.sessionId
+        if (sid == null) {
+            // The initial open never landed — it ran while disconnected, or
+            // the connection died underneath it. Retry now that the link is
+            // back instead of leaving the screen dead for the process lifetime.
+            openSessionWhenConnected()
+            return
+        }
         segmentOpen = false
         _state.update { s ->
             s.copy(
@@ -208,12 +235,14 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
                 Target.RUNTIME -> {
                     // A live session id from a session we just created: bind to
                     // it directly rather than creating another one.
+                    boundProfile = null
                     val runtime = id.orEmpty()
                     bindSession(runtime, null, "新会话")
                     loadHistory(runtime)
                 }
 
                 Target.NEW -> {
+                    boundProfile = null
                     val c = repo.createSession()
                     bindSession(c.sessionId, c.storedSessionId, "新会话")
                     settings.rememberSession(c.sessionId, c.storedSessionId)
@@ -269,6 +298,9 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
         )
     }
 
+    /** Events seen before a session was bound; replayed right after binding. */
+    private val preBindEvents = ArrayDeque<RpcEvent>()
+
     private fun bindSession(sessionId: String, stored: String?, title: String) {
         sessionGeneration++
         segmentOpen = false
@@ -290,6 +322,10 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
                 speakReplies = it.speakReplies,
             )
         }
+        // The binding now exists, so the held events can finally be filtered
+        // and applied. Re-entrant safe: handleEvent no longer buffers once
+        // `sessionId` is set.
+        while (preBindEvents.isNotEmpty()) handleEvent(preBindEvents.removeFirst())
     }
 
     // ------------------------------------------------------------- streaming ---
@@ -298,9 +334,14 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
         val sid = _state.value.sessionId
         if (ev.type.endsWith(".changed")) return
 
-        // Before a session is bound the filter would admit every session's
-        // replayed events, so hold them until we know which session we own.
-        if (sid == null) return
+        // The subscription starts before create/resume returns, so the first
+        // `session.info`, approval or streaming frame can beat the binding.
+        // Consuming it here meant it was gone for good — hold it (bounded) and
+        // replay once a session is bound, where the id filter below applies.
+        if (sid == null) {
+            if (preBindEvents.size < PRE_BIND_EVENT_LIMIT) preBindEvents.addLast(ev)
+            return
+        }
         if (ev.sessionId.isNotEmpty() && ev.sessionId != sid) return
 
         when (ev.type) {
@@ -462,7 +503,29 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
             "error", "turn.error" -> {
                 val msg = ev.payload.stringOrNull("message") ?: ev.payload.stringOrNull("error")
                     ?: "Hermes 执行出错"
-                _state.update { it.copy(error = msg, streaming = false) }
+                _state.update { s ->
+                    s.copy(
+                        error = msg,
+                        streaming = false,
+                        // A dead turn must not leave bubbles stuck "typing" or
+                        // tools spinning forever — the same repair the
+                        // reconnect path applies. A streaming row can never be
+                        // forked and later merges treat it as a live message.
+                        messages = s.messages.map { m ->
+                            val tools = m.tools.map { t ->
+                                if (t.status == ToolCall.Status.RUNNING) {
+                                    t.copy(
+                                        status = ToolCall.Status.FAILED,
+                                        endedAt = System.currentTimeMillis(),
+                                    )
+                                } else t
+                            }
+                            if (m.streaming || tools != m.tools) {
+                                m.copy(streaming = false, tools = tools)
+                            } else m
+                        },
+                    )
+                }
                 segmentOpen = false
             }
         }
@@ -614,6 +677,7 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
 
         viewModelScope.launch {
             val gen = sessionGeneration
+            val batchIds = pending.map { it.id }
             // Attachments first: the marker in the text only resolves once the
             // bytes are on the backend. If any upload fails, do NOT submit — the
             // prompt would reference files the server never received, and the
@@ -621,21 +685,34 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
             val failures = uploadPending(sid, pending)
             if (gen != sessionGeneration) return@launch
             if (failures.isNotEmpty()) {
-                // Bubble stays `delivered = false`: the prompt was never sent.
+                // The whole task stays staged — uploaded ones flagged, failed
+                // ones not — and the words go back to the composer, so the
+                // retry re-submits the *complete* prompt, not just the files
+                // that failed.
                 _state.update {
                     it.copy(
                         error = "附件上传失败，已保留待发送附件：\n" + failures.joinToString("\n"),
+                        restoreDraft = trimmed,
                     )
                 }
                 return@launch
             }
             runCatching { repo.submitPrompt(sid, composed) }.fold(
-                onSuccess = { markDelivered(bubbleKey) },
+                onSuccess = {
+                    markDelivered(bubbleKey)
+                    // The task is complete: drop exactly this batch from
+                    // staging — the user may have staged new files while the
+                    // send was still in flight.
+                    _state.update { s ->
+                        s.copy(pending = s.pending.filterNot { it.id in batchIds })
+                    }
+                },
                 onFailure = { t ->
                     _state.update {
                         it.copy(
                             error = t.friendly(),
                             streaming = false,
+                            restoreDraft = trimmed,
                             messages = it.messages.map { m ->
                                 if (m.key == bubbleKey) m.copy(delivered = false) else m
                             },
@@ -659,8 +736,11 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
         if (pending.isEmpty()) return emptyList()
         _state.update { it.copy(uploading = true) }
         val errors = mutableListOf<String>()
-        val uploaded = mutableSetOf<Long>()
+        val uploadedIds = mutableSetOf<Long>()
         for (a in pending) {
+            // Already landed in an earlier attempt of this same task: sending
+            // the bytes again would duplicate the file server-side.
+            if (a.uploaded) continue
             val kind = when (a.kind) {
                 AttachmentRef.Kind.IMAGE -> com.hermes.android.core.AttachmentKind.IMAGE
                 AttachmentRef.Kind.PDF -> com.hermes.android.core.AttachmentKind.PDF
@@ -669,14 +749,19 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
             val result = runCatching {
                 repo.attach(sessionId, a.name, kind, a.mime, a.base64)
             }
-            result.onSuccess { uploaded.add(a.id) }
+            result.onSuccess { uploadedIds.add(a.id) }
                 .onFailure { e -> errors.add("${a.name}: ${e.friendly()}") }
         }
-        // Only drop what actually landed; failures stay staged for a retry.
+        // Flag what landed; nothing leaves the staging list here. Evicting the
+        // successful uploads on a partial failure is what broke the retry: the
+        // re-send then referenced files it no longer carried. The task is only
+        // complete when the prompt itself is accepted.
         _state.update { s ->
             s.copy(
                 uploading = false,
-                pending = s.pending.filterNot { it.id in uploaded },
+                pending = s.pending.map { att ->
+                    if (att.id in uploadedIds) att.copy(uploaded = true) else att
+                },
             )
         }
         return errors
@@ -906,6 +991,9 @@ fun respondToRequest(request: ServerRequest, choice: String) = viewModelScope.la
 
     fun newSession() = viewModelScope.launch {
         val gen = sessionGeneration
+        // A fresh session is unbound: leaving the previous chat's profile
+        // attached meant a fork from here silently ran under that profile.
+        boundProfile = null
         runCatching { repo.createSession() }.fold(
             onSuccess = { c ->
                 // Same late-response race as fork(): a session switch that
@@ -921,6 +1009,9 @@ fun respondToRequest(request: ServerRequest, choice: String) = viewModelScope.la
     fun clearNotice() = _state.update { it.copy(notice = null, error = null) }
     fun setSpeakReplies(v: Boolean) = _state.update { it.copy(speakReplies = v) }
     fun setListening(v: Boolean) = _state.update { it.copy(listening = v) }
+
+    /** The composer applied a restored draft; drop the hand-off copy. */
+    fun consumeRestoreDraft() = _state.update { it.copy(restoreDraft = null) }
 
     override fun onCleared() {
         eventJob?.cancel()

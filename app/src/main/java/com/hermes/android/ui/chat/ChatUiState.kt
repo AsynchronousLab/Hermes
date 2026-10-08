@@ -73,6 +73,12 @@ data class PendingAttachment(
     val size: Long,
     val base64: String,
     val error: String? = null,
+    /**
+     * Bytes already accepted by the gateway in an earlier attempt of this same
+     * send task. The staged task stays whole until the prompt itself is
+     * submitted, so a partial-upload retry only re-sends what failed.
+     */
+    val uploaded: Boolean = false,
 )
 
 data class ChatUiState(
@@ -98,6 +104,11 @@ data class ChatUiState(
     val listening: Boolean = false,
     val speakReplies: Boolean = false,
     val pendingRequest: ServerRequest? = null,
+    /**
+     * Text handed back to the composer after a failed send (upload or submit),
+     * so a retry is one tap instead of a retype. Cleared once applied.
+     */
+    val restoreDraft: String? = null,
 )
 
 /** An interactive request the agent is blocked on (approval / clarify). */

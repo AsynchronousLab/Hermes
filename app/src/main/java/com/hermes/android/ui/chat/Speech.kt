@@ -73,6 +73,9 @@ const val MAX_TOTAL_ATTACHMENT_BYTES = 16L * 1024 * 1024
 /** Maximum number of staged attachments per message. */
 const val MAX_ATTACHMENT_COUNT = 5
 
+/** Events held while a session binding is still in flight. */
+const val PRE_BIND_EVENT_LIMIT = 64
+
 sealed interface AttachmentReadResult {
     data class Ok(val attachment: PendingAttachment) : AttachmentReadResult
     data class Rejected(val name: String, val reason: String) : AttachmentReadResult

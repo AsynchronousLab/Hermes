@@ -66,10 +66,20 @@ fun ChatScreen(
     onSpeak: (String) -> Unit,
     onRequestResponse: (ServerRequest, String) -> Unit,
     onReadError: (String) -> Unit,
+    onConsumeRestoredDraft: () -> Unit,
 ) {
     val listState = rememberLazyListState()
     var input by rememberSaveable { mutableStateOf("") }
     val context = LocalContext.current
+
+    // A failed send (upload or submit) hands the text back: retry is one tap
+    // instead of a retype.
+    LaunchedEffect(state.restoreDraft) {
+        state.restoreDraft?.let {
+            input = it
+            onConsumeRestoredDraft()
+        }
+    }
 
     // What the transcript actually shows: empty assistant rows dropped and
     // consecutive assistant rows folded into one bubble. Everything below
@@ -93,8 +103,20 @@ fun ChatScreen(
     }
     LaunchedEffect(listState) {
         snapshotFlow {
-            val last = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
-            listState.layoutInfo.totalItemsCount == 0 || last >= listState.layoutInfo.totalItemsCount - 2
+            // Bottom-edge test, not index alone: a last bubble taller than the
+            // viewport keeps its index visible while the user reads halfway up
+            // it, and an index-only check then yanked them back down on every
+            // delta. Same predicate the room transcript uses.
+            val info = listState.layoutInfo
+            val lastVisible = info.visibleItemsInfo.lastOrNull()
+            info.totalItemsCount == 0 || (
+                lastVisible != null &&
+                    lastVisible.index >= info.totalItemsCount - 1 &&
+                    remainingScrollToEnd(
+                        lastVisible.offset, lastVisible.size,
+                        info.viewportEndOffset, info.afterContentPadding,
+                    ) <= 0.5f
+                )
         }.distinctUntilChanged().collect { atBottom -> autoFollow = atBottom }
     }
 
@@ -323,7 +345,13 @@ fun ChatScreen(
                             android.speech.RecognizerIntent.EXTRA_LANGUAGE_MODEL,
                             android.speech.RecognizerIntent.LANGUAGE_MODEL_FREE_FORM,
                         )
-                        putExtra(android.speech.RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
+                        putExtra(
+                            android.speech.RecognizerIntent.EXTRA_LANGUAGE,
+                            // BCP 47 tag, not the Locale object: the extra is a
+                            // String, so a Locale rides the Serializable
+                            // overload and the recognizer ignores it.
+                            Locale.getDefault().toLanguageTag(),
+                        )
                     }
                 // A ROM with no recognizer installed makes `launch` throw
                 // ActivityNotFoundException. The bare `runCatching` swallowed it,
