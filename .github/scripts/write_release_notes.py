@@ -1,13 +1,43 @@
 """Write release notes using the APK that is about to be published."""
+import glob
 import hashlib
+import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 
+def parse_badging_version(badging: str) -> str | None:
+    """versionName from an `aapt2 dump badging` report, if present."""
+    match = re.search(r"^package:.*versionName='([^']+)'", badging, re.M)
+    return match.group(1) if match else None
+
+
+def apk_version(apk: Path) -> str | None:
+    """The APK's own versionName, read via aapt2 from the local SDK.
+
+    The notes must describe the artifact that ships, not the tag that triggered
+    the build: the two drifted apart whenever the build carried a fixed
+    versionName. Falls back to None when no aapt2 is available.
+    """
+    sdk = os.environ.get("ANDROID_SDK_ROOT") or os.environ.get("ANDROID_HOME") \
+        or "/usr/local/lib/android/sdk"
+    for aapt2 in sorted(glob.glob(os.path.join(sdk, "build-tools", "*", "aapt2*"))):
+        try:
+            badging = subprocess.check_output(
+                [aapt2, "dump", "badging", str(apk)], text=True, stderr=subprocess.DEVNULL)
+        except (OSError, subprocess.CalledProcessError):
+            continue
+        version = parse_badging_version(badging)
+        if version:
+            return version
+    return None
+
+
 def main():
     apk, output = map(Path, sys.argv[1:3])
-    version = sys.argv[3].removeprefix("v")
+    version = apk_version(apk) or sys.argv[3].removeprefix("v")
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     size = apk.stat().st_size
     with apk.open("rb") as stream:

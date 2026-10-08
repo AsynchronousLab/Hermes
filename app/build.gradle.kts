@@ -5,6 +5,18 @@ plugins {
     alias(libs.plugins.kotlin.serialization)
 }
 
+// The release channel is the git tag (v0.1.0-debug). CI exports it so the
+// APK's own metadata names the release it was built for — a fixed 0.1.0 meant
+// every build claimed to be the same version no matter which tag built it.
+// A tag that does not parse as a version (e.g. "main" from a branch build)
+// falls back to the baseline instead of leaking into versionName.
+val releaseTag = System.getenv("CNB_BRANCH") ?: System.getenv("GITHUB_REF_NAME")
+val releaseVersion = releaseTag
+    ?.removePrefix("v")
+    ?.takeIf { it.matches(Regex("""\d+(\.\d+){0,2}(-.*)?""")) }
+    ?.substringBefore('-')
+val versionParts = releaseVersion?.split('.')?.mapNotNull { it.toIntOrNull() }
+
 android {
     namespace = "com.hermes.android"
     compileSdk = 35
@@ -16,8 +28,11 @@ android {
         applicationId = "com.hermes.android"
         minSdk = 31
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = versionParts
+            ?.let { (it.getOrNull(0) ?: 0) * 10_000 + (it.getOrNull(1) ?: 0) * 100 + (it.getOrNull(2) ?: 0) }
+            ?.coerceAtLeast(1)
+            ?: 1
+        versionName = releaseVersion ?: "0.1.0"
         vectorDrawables { useSupportLibrary = true }
     }
 

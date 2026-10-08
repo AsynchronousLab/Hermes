@@ -70,5 +70,28 @@ class ReleaseSourceTest(unittest.TestCase):
         self.assertNotEqual(0, self.verify("v-missing").returncode)
 
 
+class ReleaseNotesVersionTest(unittest.TestCase):
+    """The notes must quote the APK's own versionName, not the tag."""
+
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location(
+            "write_release_notes", TOOLS / "write_release_notes.py")
+        cls.notes = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.notes)
+
+    def test_version_is_read_from_the_badging_package_line(self):
+        badging = (
+            "package: name='com.hermes.android.debug' versionCode='100' "
+            "versionName='0.1.1-debug' platformBuildVersionName=''\n"
+            "sdkVersion:'31'\n"
+        )
+        self.assertEqual("0.1.1-debug", self.notes.parse_badging_version(badging))
+
+    def test_badging_without_a_version_line_yields_none(self):
+        self.assertIsNone(self.notes.parse_badging_version("sdkVersion:'31'\n"))
+        self.assertIsNone(self.notes.parse_badging_version(""))
+
+
 if __name__ == "__main__":
     unittest.main()
