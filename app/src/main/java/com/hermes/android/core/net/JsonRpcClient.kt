@@ -597,9 +597,9 @@ private fun handleFrame(text: String) {
             raw = params,
             seq = seq,
         )
-        // trySend keeps ordering intact; dropping under extreme pressure is
-        // preferable to suspending the socket callback thread.
-        eventQueue.trySend(ev)
+        // Bounded, non-suspending enqueue: under extreme pressure the oldest
+        // frame is evicted rather than the newest (see offerLatest).
+        offerLatest(eventQueue, ev)
     }
 
     private fun failAllPending(t: Throwable) {
@@ -678,3 +678,19 @@ private fun handleFrame(text: String) {
 }
 
 private fun JsonPrimitive.contentOrNullSafe(): String? = if (this is JsonNull) null else content
+
+/**
+ * Enqueues one event, evicting the oldest queued frame if the queue is full.
+ *
+ * The socket callback thread must not suspend, so a full queue means a drop —
+ * and dropping the *newest* frame is the worst trade: a completion lost in
+ * favour of an ancient start leaves the UI stuck on "streaming" with no
+ * follow-up frame to repair it. Evict from the front instead, so the freshest
+ * state always wins; a dropped `start` is self-healing because the next delta
+ * re-opens the segment.
+ */
+internal fun <T> offerLatest(queue: Channel<T>, ev: T): Boolean {
+    if (queue.trySend(ev).isSuccess) return true
+    queue.tryReceive()
+    return queue.trySend(ev).isSuccess
+}
