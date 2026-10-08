@@ -28,6 +28,7 @@ data class RoomUiState(
     val supported: Boolean? = null,
     val error: String? = null,
     val notice: String? = null,
+    val historyWarning: String? = null,
     /**
      * Text handed back to the composer after a refused or definitively-failed
      * send, so a retry is one tap instead of a retype. Cleared once applied.
@@ -119,6 +120,8 @@ class RoomChatViewModel(
                 return
             }
         val known = topSeq
+        val warning = roomLogWarning(page, known)
+        _state.update { it.copy(historyWarning = warning ?: it.historyWarning) }
         val fresh = page.events
             .filter { it.seq != null && (known == null || it.seq > known) }
             .mapNotNull { it.toMessage() }
@@ -222,7 +225,7 @@ class RoomChatViewModel(
         }
         // One logical post, one idempotency key, minted before the first wire
         // attempt and held on the echo so every retry of this post reuses it.
-        val eventId = repo.newSendEventId(trimmed)
+        val eventId = repo.newSendEventId()
         val echoKey = "local-${System.nanoTime()}"
         _state.update { s ->
             s.copy(
@@ -270,7 +273,7 @@ class RoomChatViewModel(
             )
         }
         viewModelScope.launch {
-            dispatchSend(key, echo.text, echo.eventId ?: repo.newSendEventId(echo.text))
+            dispatchSend(key, echo.text, echo.eventId ?: repo.newSendEventId())
         }
     }
 

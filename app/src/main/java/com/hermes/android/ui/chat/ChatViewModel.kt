@@ -15,6 +15,9 @@ import com.hermes.android.core.net.RpcEvent
 import com.hermes.android.core.net.RpcFailure
 import com.hermes.android.core.store.SettingsStore
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -94,6 +97,13 @@ class ChatViewModel(
     private var nextKey = 1L
     private var nextAttachId = 1L
     private var eventJob: Job? = null
+    private val historyMutex = Mutex()
+    private var transcriptRevision = 0L
+    private var requestRevision = 0L
+    private var requestRecoveryJob: Job? = null
+    private var historyRecoveryJob: Job? = null
+    private var refreshAfterTurn = false
+    private val pendingSendKeys = mutableSetOf<Long>()
 
     /** True while a tool call means no text segment is open. */
     private var segmentOpen = false
@@ -130,6 +140,15 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
     init {
         observeConnection()
         observeEvents()
+        viewModelScope.launch {
+            var seen = repo.rpc.eventLossVersion.value
+            repo.rpc.eventLossVersion.collect { version ->
+                if (version != seen) {
+                    seen = version
+                    onReconnected()
+                }
+            }
+        }
         viewModelScope.launch {
             val reasoningWire = runCatching { settings.reasoningLevel.first() }.getOrNull()
             _state.update { it.copy(reasoning = ReasoningLevel.from(reasoningWire)) }
@@ -170,6 +189,8 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
         // mistaken for a recovery and does not trigger a redundant history load.
         var wasConnected = repo.connection.value == RpcConnectionState.Connected
         repo.connection.collect { c ->
+            transcriptRevision++
+            requestRevision++
             val connected = c == RpcConnectionState.Connected
             val recovered = connected && !wasConnected
             wasConnected = connected
@@ -196,13 +217,43 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
             return
         }
         segmentOpen = false
+        refreshAfterTurn = refreshAfterTurn || _state.value.streaming
         _state.update { s ->
             s.copy(
                 streaming = false,
                 messages = s.messages.map { if (it.streaming) it.copy(streaming = false) else it },
             )
         }
-        viewModelScope.launch { loadHistory(sid) }
+        recoverOpenRequests(sid)
+        scheduleHistoryRecovery(sid)
+    }
+
+    private fun scheduleHistoryRecovery(sid: String) {
+        historyRecoveryJob?.cancel()
+        historyRecoveryJob = viewModelScope.launch { loadHistory(sid) }
+    }
+
+    private fun recoverOpenRequests(sid: String) {
+        requestRecoveryJob?.cancel()
+        val gen = sessionGeneration
+        requestRecoveryJob = viewModelScope.launch {
+            try {
+                val result = readStableSnapshot(
+                    isCurrent = { gen == sessionGeneration && _state.value.sessionId == sid && repo.isConnected },
+                    revision = { requestRevision },
+                    read = { repo.sessionEvents() },
+                ) ?: return@launch
+                _state.update { s ->
+                    s.copy(pendingRequest = recoverRequest(result.openRequests, sid, s.pendingRequest?.id))
+                }
+            } catch (t: CancellationException) {
+                throw t
+            } catch (t: Throwable) {
+                if (gen == sessionGeneration) _state.update {
+                    it.copy(error = "恢复待确认请求失败：${t.friendly()}")
+                }
+            }
+        }
     }
 
     private fun observeEvents() {
@@ -257,45 +308,44 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
 
     private suspend fun loadHistory(sessionId: String): Boolean {
         val gen = sessionGeneration
-        // Snapshot what is already on screen. Anything that shows up from here
-        // on arrived live and has to survive the merge below.
-        val keysAtRequest = _state.value.messages.mapTo(HashSet()) { it.key }
-        return runCatching { repo.history(sessionId) }.onSuccess { res ->
-            // A fork/new-session may have switched sessions while we were loading.
-            if (gen != sessionGeneration) return@onSuccess
-            val rows = res.messages.map { m ->
-                ChatMessage(
-                    key = nextKey++,
-                    role = when {
-                        m.isUser -> ChatMessage.Role.User
-                        m.isSystem -> ChatMessage.Role.System
-                        else -> ChatMessage.Role.Assistant
-                    },
-                    text = m.body,
-                    reasoning = m.reasoning.orEmpty(),
-                    timestamp = ((m.timestamp ?: 0.0) * 1000).toLong(),
-                )
-            }
-            // Merge: keep every message that arrived live while we were loading.
-            // Filtering on `streaming || tools.isNotEmpty()` used to keep only
-            // the still-in-flight ones, so a message that had already completed
-            // during the load window was in neither `rows` nor the kept set and
-            // vanished from the transcript entirely.
-            _state.update { s ->
-                val arrivedLive = s.messages.filter { it.key !in keysAtRequest }
-                s.copy(messages = rows + arrivedLive)
-            }
-        }.fold(
-            onSuccess = { true },
-            onFailure = { t ->
-                // Swallowing this left the caller reporting success over an empty
-                // transcript: bindSession had already cleared the messages, and
-                // the fork path then showed "已从此处创建分支会话" over a blank
-                // branch with no way to tell it had failed.
-                _state.update { it.copy(error = "读取历史失败：${t.friendly()}") }
+        return historyMutex.withLock {
+            try {
+                val res = readStableSnapshot(
+                    isCurrent = { gen == sessionGeneration && _state.value.sessionId == sessionId && repo.isConnected },
+                    revision = { transcriptRevision },
+                    canRead = { pendingSendKeys.isEmpty() },
+                    read = { repo.history(sessionId) },
+                ) ?: return@withLock false
+                val rows = res.messages.map { m ->
+                    ChatMessage(
+                        key = nextKey++,
+                        role = when {
+                            m.isUser -> ChatMessage.Role.User
+                            m.isSystem -> ChatMessage.Role.System
+                            else -> ChatMessage.Role.Assistant
+                        },
+                        text = m.body,
+                        reasoning = m.reasoning.orEmpty(),
+                        timestamp = ((m.timestamp ?: 0.0) * 1000).toLong(),
+                    )
+                }
+                // A quiet snapshot replaces delivered rows; never concatenate the
+                // overlapping history and live streams or deduplicate by wording.
+                refreshAfterTurn = refreshAfterTurn || _state.value.streaming
+                segmentOpen = false
+                _state.update { s ->
+                    s.copy(messages = mergeHistorySnapshot(rows, s.messages), streaming = false)
+                }
+                true
+            } catch (t: CancellationException) {
+                throw t
+            } catch (t: Throwable) {
+                if (gen == sessionGeneration) {
+                    _state.update { it.copy(error = "读取历史失败：${t.friendly()}") }
+                }
                 false
-            },
-        )
+            }
+        }
     }
 
     /** Events seen before a session was bound; replayed right after binding. */
@@ -303,6 +353,10 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
 
     private fun bindSession(sessionId: String, stored: String?, title: String) {
         sessionGeneration++
+        historyRecoveryJob?.cancel()
+        requestRecoveryJob?.cancel()
+        refreshAfterTurn = false
+        pendingSendKeys.clear()
         segmentOpen = false
         _state.update {
             // Reset every session-scoped field: carrying messages or a pending
@@ -326,6 +380,7 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
         // and applied. Re-entrant safe: handleEvent no longer buffers once
         // `sessionId` is set.
         while (preBindEvents.isNotEmpty()) handleEvent(preBindEvents.removeFirst())
+        recoverOpenRequests(sessionId)
     }
 
     // ------------------------------------------------------------- streaming ---
@@ -343,6 +398,7 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
             return
         }
         if (ev.sessionId.isNotEmpty() && ev.sessionId != sid) return
+        transcriptRevision++
 
         when (ev.type) {
             "message.start" -> {
@@ -475,29 +531,11 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
                 _state.update { s -> s.copy(title = t) }
             }
 
-            "approval.request" -> _state.update {
-                it.copy(
-                    pendingRequest = ServerRequest(
-                        id = ev.payload.stringOrNull("request_id") ?: ev.payload.stringOrNull("id").orEmpty(),
-                        kind = ServerRequest.Kind.APPROVAL,
-                        text = ev.payload.stringOrNull("command")
-                            ?: ev.payload.stringOrNull("description")
-                            ?: ev.payload.stringOrNull("reason")
-                            ?: "工具请求执行操作",
-                    )
-                )
-            }
-
-            "clarify.request" -> _state.update {
-                it.copy(
-                    pendingRequest = ServerRequest(
-                        id = ev.payload.stringOrNull("request_id") ?: ev.payload.stringOrNull("id").orEmpty(),
-                        kind = ServerRequest.Kind.CLARIFY,
-                        text = ev.payload.stringOrNull("question")
-                            ?: ev.payload.stringOrNull("message")
-                            ?: "Hermes 想确认一下",
-                    )
-                )
+            "approval.request", "clarify.request" -> {
+                requestRevision++
+                val card = requestCard(ev.type,
+                    ev.payload.stringOrNull("request_id") ?: ev.payload.stringOrNull("id").orEmpty(), ev.payload)
+                if (card != null) _state.update { it.copy(pendingRequest = card) }
             }
 
             "error", "turn.error" -> {
@@ -528,6 +566,10 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
                 }
                 segmentOpen = false
             }
+        }
+        if (refreshAfterTurn && ev.type in setOf("message.complete", "turn.error", "error")) {
+            refreshAfterTurn = false
+            scheduleHistoryRecovery(sid)
         }
     }
 
@@ -662,6 +704,8 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
         // immediately. `delivered = false` until the gateway has it, so a failed
         // send reads as "未发送" instead of looking like a delivered message.
         val bubbleKey = nextKey++
+        pendingSendKeys.add(bubbleKey)
+        transcriptRevision++
         _state.update {
             it.copy(
                 messages = it.messages + ChatMessage(
@@ -677,56 +721,66 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
 
         viewModelScope.launch {
             val gen = sessionGeneration
-            val batchIds = pending.map { it.id }
-            // Attachments first: the marker in the text only resolves once the
-            // bytes are on the backend. If any upload fails, do NOT submit — the
-            // prompt would reference files the server never received, and the
-            // user loses the chance to retry.
-            val failures = uploadPending(sid, pending)
-            if (gen != sessionGeneration) return@launch
-            if (failures.isNotEmpty()) {
-                // The whole task stays staged — uploaded ones flagged, failed
-                // ones not — and the words go back to the composer, so the
-                // retry re-submits the *complete* prompt, not just the files
-                // that failed.
-                _state.update {
-                    it.copy(
-                        error = "附件上传失败，已保留待发送附件：\n" + failures.joinToString("\n"),
-                        restoreDraft = trimmed,
-                    )
-                }
-                return@launch
-            }
-            runCatching { repo.submitPrompt(sid, composed) }.fold(
-                onSuccess = {
-                    markDelivered(bubbleKey)
-                    // The task is complete: drop exactly this batch from
-                    // staging — the user may have staged new files while the
-                    // send was still in flight.
-                    _state.update { s ->
-                        s.copy(pending = s.pending.filterNot { it.id in batchIds })
-                    }
-                },
-                onFailure = { t ->
+            try {
+                val batchIds = pending.map { it.id }
+                // Attachments first: the marker in the text only resolves once the
+                // bytes are on the backend. If any upload fails, do NOT submit — the
+                // prompt would reference files the server never received, and the
+                // user loses the chance to retry.
+                val failures = uploadPending(sid, pending)
+                if (gen != sessionGeneration) return@launch
+                if (failures.isNotEmpty()) {
+                    // The whole task stays staged — uploaded ones flagged, failed
+                    // ones not — and the words go back to the composer, so the
+                    // retry re-submits the *complete* prompt, not just the files
+                    // that failed.
                     _state.update {
                         it.copy(
-                            error = t.friendly(),
-                            streaming = false,
+                            error = "附件上传失败，已保留待发送附件：\n" + failures.joinToString("\n"),
                             restoreDraft = trimmed,
-                            messages = it.messages.map { m ->
-                                if (m.key == bubbleKey) m.copy(delivered = false) else m
-                            },
                         )
                     }
-                },
-            )
+                    return@launch
+                }
+                runCatching { repo.submitPrompt(sid, composed) }.fold(
+                    onSuccess = {
+                        if (gen != sessionGeneration) return@fold
+                        markDelivered(bubbleKey)
+                        // The task is complete: drop exactly this batch from
+                        // staging — the user may have staged new files while the
+                        // send was still in flight.
+                        _state.update { s ->
+                            s.copy(pending = s.pending.filterNot { it.id in batchIds })
+                        }
+                    },
+                    onFailure = { t ->
+                        if (gen != sessionGeneration) return@fold
+                        _state.update {
+                            it.copy(
+                                error = t.friendly(),
+                                streaming = false,
+                                restoreDraft = trimmed,
+                                messages = it.messages.map { m ->
+                                    if (m.key == bubbleKey) m.copy(delivered = false) else m
+                                },
+                            )
+                        }
+                    },
+                )
+            } finally {
+                pendingSendKeys.remove(bubbleKey)
+                transcriptRevision++
+            }
         }
         return true
     }
 
     /** Flips a user bubble to its delivered state once the gateway accepted it. */
-    private fun markDelivered(key: Long) = _state.update { s ->
-        s.copy(messages = s.messages.map { if (it.key == key) it.copy(delivered = true) else it })
+    private fun markDelivered(key: Long) {
+        transcriptRevision++
+        _state.update { s ->
+            s.copy(messages = s.messages.map { if (it.key == key) it.copy(delivered = true) else it })
+        }
     }
 
     private suspend fun uploadPending(
@@ -893,14 +947,21 @@ fun addAttachments(items: List<PendingAttachment>) {
  * user unable to retry.
  */
 fun respondToRequest(request: ServerRequest, choice: String) = viewModelScope.launch {
+        val gen = sessionGeneration
+        requestRevision++
         runCatching { repo.serverResponse(request.id, choice) }.fold(
             onSuccess = {
+                if (gen != sessionGeneration) return@fold
+                requestRevision++
                 _state.update { s ->
                     if (s.pendingRequest?.id == request.id) s.copy(pendingRequest = null)
                     else s
                 }
+                _state.value.sessionId?.let { recoverOpenRequests(it) }
             },
             onFailure = { t ->
+                if (t is CancellationException) throw t
+                if (gen != sessionGeneration) return@fold
                 _state.update { it.copy(error = "回应失败：${t.friendly()}，请重试") }
             },
         )

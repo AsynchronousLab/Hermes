@@ -37,6 +37,7 @@ def apk_version(apk: Path) -> str | None:
 
 def main():
     apk, output = map(Path, sys.argv[1:3])
+    changes = release_changes(output.read_text(encoding="utf-8"))
     version = apk_version(apk) or sys.argv[3].removeprefix("v")
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     size = apk.stat().st_size
@@ -72,18 +73,20 @@ APK 里**不含预置的后端登录凭据**。后端地址、用户名和密码
 
 ## 这个版本包含
 
-对应 commit `{commit}`，主要功能：
+对应 commit `{commit}`。
 
-- 群聊：room transcript、composer、`groups.*` 接口
-- IM 风格统一会话列表、消息跳转按钮
-- 逐条回复 fork
-- 重连恢复：Cookie 失效自动重新登录并补齐历史
-- 会话删除
-- 消息按 `actor.kind` 分类，不再依赖硬编码 profile
-- 后端密码加密保存
+{changes}
 
 """
     output.write_text(notes, encoding="utf-8")
+
+
+def release_changes(notes: str) -> str:
+    """Keep the reviewed changelog from the tagged source in both release pages."""
+    _, marker, changes = notes.partition("## 这个版本包含")
+    if not marker or not changes.strip():
+        raise ValueError("RELEASE_NOTES.md must contain a nonempty changelog")
+    return changes.strip()
 
 
 if __name__ == "__main__":

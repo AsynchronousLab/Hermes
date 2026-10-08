@@ -12,6 +12,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -44,6 +45,9 @@ sealed class RpcFailure(message: String) : Exception(message) {
 
     data class NotConnected(val method: String) :
         RpcFailure("尚未连接到后端: $method")
+
+    /** A submitted call may have reached the server before its reply was lost. */
+    class ConnectionClosed : RpcFailure("连接已关闭，请求结果未知")
 }
 
 /**
@@ -101,6 +105,8 @@ class JsonRpcClient(
      * a delta could be handled before the `start` that opened its segment.
      */
     private val eventQueue = Channel<RpcEvent>(capacity = 1024)
+    private val _eventLossVersion = MutableStateFlow(0L)
+    val eventLossVersion: StateFlow<Long> = _eventLossVersion.asStateFlow()
     private val consumerJob: Job
 
     /**
@@ -247,7 +253,7 @@ class JsonRpcClient(
 
                 socket = null
                 if (handshake === mine) handshake = null
-                failAllPending(cmd.error ?: RpcFailure.NotConnected("*"))
+                failAllPending(cmd.error ?: RpcFailure.ConnectionClosed())
 
                 if (closedByUser) {
                     _state.value = RpcConnectionState.Disconnected
@@ -376,7 +382,7 @@ class JsonRpcClient(
         handshake = null
         socket?.close(1000, "client closing")
         socket = null
-        failAllPending(RpcFailure.NotConnected("*"))
+        failAllPending(RpcFailure.ConnectionClosed())
     }
 
     /**
@@ -599,7 +605,7 @@ private fun handleFrame(text: String) {
         )
         // Bounded, non-suspending enqueue: under extreme pressure the oldest
         // frame is evicted rather than the newest (see offerLatest).
-        offerLatest(eventQueue, ev)
+        offerLatest(eventQueue, ev) { _eventLossVersion.update { it + 1 } }
     }
 
     private fun failAllPending(t: Throwable) {
@@ -613,10 +619,8 @@ private fun handleFrame(text: String) {
         deserializer: KSerializer<T>,
         timeoutMs: Long = 30_000,
     ): T = withContext(Dispatchers.IO) {
-        val ws = socket ?: throw RpcFailure.NotConnected(method)
         val id = "r${idSeq.incrementAndGet()}"
         val deferred = CompletableDeferred<JsonObject>()
-        pending[id] = deferred
 
         val payload = buildJsonObject {
             put("jsonrpc", JsonPrimitive("2.0"))
@@ -624,18 +628,20 @@ private fun handleFrame(text: String) {
             put("method", JsonPrimitive(method))
             put("params", params)
         }
-        if (!ws.send(payload.toString())) {
-            pending.remove(id)
-            throw RpcFailure.Rpc(-1, "WebSocket 发送失败: $method")
-        }
-
         val reply = try {
+            // Registration and send share the teardown lock: a close cannot
+            // drain pending calls just before this one registers on a dead socket.
+            mutex.withLock {
+                val ws = socket ?: throw RpcFailure.NotConnected(method)
+                pending[id] = deferred
+                if (!ws.send(payload.toString())) {
+                    throw RpcFailure.Rpc(-1, "WebSocket 发送失败: $method")
+                }
+            }
             withTimeoutOrNull(timeoutMs) { deferred.await() }
-        } catch (e: CancellationException) {
+        } finally {
             pending.remove(id)
-            throw e
         }
-        pending.remove(id)
         if (reply == null) throw RpcFailure.Timeout(method)
 
         reply["error"]?.let { err ->
@@ -689,8 +695,10 @@ private fun JsonPrimitive.contentOrNullSafe(): String? = if (this is JsonNull) n
  * state always wins; a dropped `start` is self-healing because the next delta
  * re-opens the segment.
  */
-internal fun <T> offerLatest(queue: Channel<T>, ev: T): Boolean {
+internal fun <T> offerLatest(queue: Channel<T>, ev: T, onDropped: () -> Unit = {}): Boolean {
     if (queue.trySend(ev).isSuccess) return true
-    queue.tryReceive()
-    return queue.trySend(ev).isSuccess
+    if (queue.tryReceive().isSuccess) onDropped()
+    val result = queue.trySend(ev)
+    if (result.isFailure && !result.isClosed) onDropped()
+    return result.isSuccess
 }

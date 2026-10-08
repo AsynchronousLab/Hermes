@@ -7,6 +7,15 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class OfferLatestTest {
+    @Test fun overflowSignalsRecoveryEvenThoughTheNewestEventWasAccepted() {
+        val ch = Channel<Int>(capacity = 1)
+        var losses = 0
+        offerLatest(ch, 1) { losses++ }
+        assertEquals(0, losses)
+        assertTrue(offerLatest(ch, 2) { losses++ })
+        assertEquals(1, losses)
+        assertEquals(2, ch.tryReceive().getOrNull())
+    }
     @Test fun roomAvailableEnqueuesInOrder() {
         val ch = Channel<Int>(capacity = 4)
         assertTrue(offerLatest(ch, 1))

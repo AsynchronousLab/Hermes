@@ -147,6 +147,9 @@ fun RoomChatScreen(
 
             state.error?.let { RoomBanner(it, isError = true, onDismiss = onDismiss) }
             state.notice?.let { RoomBanner(it, isError = false, onDismiss = onDismiss) }
+            state.historyWarning?.let {
+                Text(it, modifier = Modifier.padding(12.dp), color = MaterialTheme.colorScheme.error)
+            }
 
             when {
                 // weight(1f), not fillMaxSize(): a fillMaxSize child eats the

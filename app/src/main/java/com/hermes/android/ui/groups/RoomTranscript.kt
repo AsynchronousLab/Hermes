@@ -66,10 +66,11 @@ internal fun mergeRoomMessages(
  * answered with an error, or `WebSocket.send` refused the frame outright — in
  * either case nothing reached the room. [RpcFailure.NotConnected] means no
  * socket existed when the call was made, so the request never left the phone.
+ * [RpcFailure.ConnectionClosed] means a submitted request lost its reply.
  * Everything else — a [RpcFailure.Timeout] with the request possibly slow in
  * flight, the raw OkHttp throwable a dropped socket fails pending calls with,
  * a cancelled coroutine — may already be in the log, and only a retry that
  * reuses the same `event_id` is safe.
  */
 internal fun isUnknownOutcome(t: Throwable): Boolean =
-    t !is RpcFailure || t is RpcFailure.Timeout
+    t !is RpcFailure || t is RpcFailure.Timeout || t is RpcFailure.ConnectionClosed

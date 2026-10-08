@@ -168,8 +168,8 @@ data class RoomEvent(
 /**
  * `groups.log` page.
  *
- * When nothing new matches `after`, both [cursor] and [latestSeq] come back
- * `null` — never overwrite a locally held cursor with those.
+ * Coverage metadata is optional. The current gateway rejects cursor inputs;
+ * retain these fields to detect an incomplete page, not to invent pagination.
  */
 @Serializable
 data class RoomLog(

@@ -88,7 +88,6 @@ class SessionListViewModel(
     val state: StateFlow<SessionListUiState> = _state.asStateFlow()
 
     private var watchJob: Job? = null
-    private var lastSessionId: String? = null
 
     init {
         observeConnection()
@@ -174,7 +173,6 @@ class SessionListViewModel(
         runCatching { repo.createSession() }.fold(
             onSuccess = { c ->
                 settings.rememberSession(c.sessionId, c.storedSessionId)
-                lastSessionId = c.sessionId
                 onCreated(c.sessionId)
                 refresh(silent = true)
             },
@@ -206,7 +204,6 @@ class SessionListViewModel(
         }
     }
 
-    fun rememberNew(sessionId: String) { lastSessionId = sessionId }
 
     /**
      * Deletes a stored session.

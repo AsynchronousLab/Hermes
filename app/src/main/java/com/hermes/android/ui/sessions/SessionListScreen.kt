@@ -368,6 +368,7 @@ private fun RoomRow(room: Group, onClick: () -> Unit) {
 @Composable
 private fun SourceTag(source: String) {
     val label = when (source) {
+        "android" -> "Android"
         "cron" -> "定时"
         "desktop" -> "桌面"
         "feishu" -> "飞书"

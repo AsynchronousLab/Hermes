@@ -92,6 +92,15 @@ class ReleaseNotesVersionTest(unittest.TestCase):
         self.assertIsNone(self.notes.parse_badging_version("sdkVersion:'31'\n"))
         self.assertIsNone(self.notes.parse_badging_version(""))
 
+    def test_reviewed_changelog_is_preserved(self):
+        changes = "### 修复\n\n- 恢复审批请求\n- Android 来源"
+        self.assertEqual(changes, self.notes.release_changes("# Release\n\n## 这个版本包含\n\n" + changes + "\n"))
+
+    def test_missing_changelog_fails_instead_of_publishing_stale_notes(self):
+        for text in ("# Release", "## 这个版本包含\n"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                self.notes.release_changes(text)
+
 
 if __name__ == "__main__":
     unittest.main()

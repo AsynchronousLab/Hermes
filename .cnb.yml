@@ -17,7 +17,7 @@
 
             tag = os.environ['CNB_BRANCH']
             commit = os.environ['CNB_COMMIT']
-            api = 'https://api.github.com/repos/Mavelsate/Hermes'
+            api = 'https://api.github.com/repos/AsynchronousLab/Hermes'
 
             def read_json(url):
                 req = urllib.request.Request(url, headers={'User-Agent': 'Hermes-CNB-release'})

@@ -19,6 +19,10 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import okhttp3.OkHttpClient
 
+// session.create/resume accept an explicit source; omission uses the gateway's
+// own platform (often "tui"), which does not identify this Android client.
+private const val ANDROID_SESSION_SOURCE = "android"
+
 /**
  * Single facade over the Hermes gateway.
  *
@@ -294,7 +298,7 @@ class HermesRepository {
         rpc.rpc("session.list", JsonObject(emptyMap()), SessionListResult.serializer()).sessions
 
     suspend fun createSession(): SessionCreated =
-        rpc.rpc("session.create", JsonObject(emptyMap()), SessionCreated.serializer())
+        createSession(profile = null)
 
     /**
      * Opens a session bound to a named profile.
@@ -307,7 +311,10 @@ class HermesRepository {
     suspend fun createSession(profile: String?): SessionCreated =
         rpc.rpc(
             "session.create",
-            buildJsonObject { if (!profile.isNullOrBlank()) put("profile", profile) },
+            buildJsonObject {
+                put("source", ANDROID_SESSION_SOURCE)
+                if (!profile.isNullOrBlank()) put("profile", profile)
+            },
             SessionCreated.serializer(),
         )
 
@@ -315,7 +322,10 @@ class HermesRepository {
     suspend fun resumeSession(storedSessionId: String): SessionCreated =
         rpc.rpc(
             "session.resume",
-            buildJsonObject { put("session_id", storedSessionId) },
+            buildJsonObject {
+                put("session_id", storedSessionId)
+                put("source", ANDROID_SESSION_SOURCE)
+            },
             SessionCreated.serializer(),
         )
 
@@ -341,6 +351,7 @@ class HermesRepository {
         val seeded = rpc.rpc(
             "session.create",
             buildJsonObject {
+                put("source", ANDROID_SESSION_SOURCE)
                 profile?.takeIf { it.isNotBlank() }?.let { put("profile", it) }
                 put("parent_session_id", sessionId)
                 put(
@@ -640,8 +651,8 @@ class HermesRepository {
      * diff locally by `seq`; that is also how the Desktop catches up after a
      * reconnect.
      *
-     * `max_log_limit` is 500, so a room longer than that is truncated to its
-     * first page. A larger `limit` is refused rather than clamped.
+     * `max_log_limit` is 500. A larger `limit` is refused rather than clamped;
+     * callers must inspect coverage metadata instead of assuming a complete log.
      */
     suspend fun groupLog(roomId: String, limit: Int = 500): RoomLog = rpc.rpc(
         "groups.log",
@@ -660,8 +671,7 @@ class HermesRepository {
      * the original delivery, so a retry that reuses the id can never
      * double-post while a retry that mints fresh always can.
      */
-    fun newSendEventId(text: String): String =
-        "send-${System.currentTimeMillis().toString(36)}-${text.hashCode()}"
+    fun newSendEventId(): String = "send-${java.util.UUID.randomUUID()}"
 
     /**
      * Posts into a room.
@@ -684,7 +694,7 @@ class HermesRepository {
     ): GroupSendResult = rpc.rpc(
         "groups.send",
         buildJsonObject {
-            put("event_id", eventId ?: newSendEventId(text))
+            put("event_id", eventId ?: newSendEventId())
             put("room_id", roomId)
             put("profile", profile)
             put(

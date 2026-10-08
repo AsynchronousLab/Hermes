@@ -46,6 +46,7 @@ class RoomTranscriptTest {
     }
 
     @Test fun timeoutAndRawSocketDeathLeaveTheOutcomeUnknown() {
+        assertTrue(isUnknownOutcome(RpcFailure.ConnectionClosed()))
         assertTrue(isUnknownOutcome(RpcFailure.Timeout("groups.send")))
         assertTrue(isUnknownOutcome(IOException("connection reset")))
     }
