@@ -16,13 +16,16 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.text.withLink
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
@@ -43,18 +46,32 @@ fun MarkdownText(
     color: Color = MaterialTheme.colorScheme.onSurface,
 ) {
     val blocks = remember(text) { parseMarkdown(text) }
+    // Model-provided links must actually open: the label was styled like a
+    // link while the URL was discarded, so reference material looked clickable
+    // and was not.
+    val context = LocalContext.current
+    val openLink: (String) -> Unit = { url ->
+        runCatching {
+            context.startActivity(
+                android.content.Intent(
+                    android.content.Intent.ACTION_VIEW,
+                    android.net.Uri.parse(url),
+                )
+            )
+        }
+    }
     Column(modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         blocks.forEach { block ->
             when (block) {
                 is MdBlock.Code -> CodeBlock(block)
                 is MdBlock.Paragraph -> Text(
-                    inlineStyled(block.text, color),
+                    inlineStyled(block.text, color, openLink),
                     style = MaterialTheme.typography.bodyLarge,
                     color = color,
                 )
 
                 is MdBlock.Heading -> Text(
-                    inlineStyled(block.text, color),
+                    inlineStyled(block.text, color, openLink),
                     fontSize = when (block.level) {
                         1 -> 21.sp
                         2 -> 19.sp
@@ -68,7 +85,7 @@ fun MarkdownText(
                 is MdBlock.Bullet -> Row(Modifier.padding(start = 4.dp)) {
                     Text("•", color = color, modifier = Modifier.width(14.dp))
                     Text(
-                        inlineStyled(block.text, color),
+                        inlineStyled(block.text, color, openLink),
                         style = MaterialTheme.typography.bodyLarge,
                         color = color,
                     )
@@ -82,7 +99,7 @@ fun MarkdownText(
                         fontWeight = FontWeight.Medium,
                     )
                     Text(
-                        inlineStyled(block.text, color),
+                        inlineStyled(block.text, color, openLink),
                         style = MaterialTheme.typography.bodyLarge,
                         color = color,
                     )
@@ -98,7 +115,7 @@ fun MarkdownText(
                     )
                     Spacer(Modifier.width(8.dp))
                     Text(
-                        inlineStyled(block.text, color.copy(alpha = 0.85f)),
+                        inlineStyled(block.text, color.copy(alpha = 0.85f), openLink),
                         style = MaterialTheme.typography.bodyLarge,
                         fontStyle = FontStyle.Italic,
                     )
@@ -109,7 +126,7 @@ fun MarkdownText(
                     color = MaterialTheme.colorScheme.outlineVariant,
                 )
 
-                is MdBlock.Table -> TableBlock(block, color)
+                is MdBlock.Table -> TableBlock(block, color, openLink)
             }
         }
     }
@@ -175,7 +192,7 @@ private fun CodeBlock(block: MdBlock.Code) {
 }
 
 @Composable
-private fun TableBlock(block: MdBlock.Table, color: Color) {
+private fun TableBlock(block: MdBlock.Table, color: Color, openLink: (String) -> Unit) {
     Column(
         Modifier.fillMaxWidth()
             .clip(RoundedCornerShape(8.dp))
@@ -184,7 +201,7 @@ private fun TableBlock(block: MdBlock.Table, color: Color) {
         Row(Modifier.background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))) {
             block.headers.forEach { h ->
                 Text(
-                    inlineStyled(h, color),
+                    inlineStyled(h, color, openLink),
                     fontWeight = FontWeight.SemiBold,
                     fontSize = 13.sp,
                     modifier = Modifier.weight(1f).padding(7.dp),
@@ -196,7 +213,7 @@ private fun TableBlock(block: MdBlock.Table, color: Color) {
             Row {
                 row.forEach { cell ->
                     Text(
-                        inlineStyled(cell, color),
+                        inlineStyled(cell, color, openLink),
                         fontSize = 13.sp,
                         modifier = Modifier.weight(1f).padding(7.dp),
                     )
@@ -214,9 +231,16 @@ private val INLINE = Regex(
 )
 private val LINK = Regex("^\\[([^\\]]+)]\\((.*)\\)$")
 
+/** Label and URL of one `[label](url)` token, or null when it is not a link. */
+internal fun linkLabelUrl(token: String): Pair<String, String>? =
+    LINK.find(token)?.let { m ->
+        val url = m.groupValues[2]
+        if (url.isEmpty()) null else m.groupValues[1] to url
+    }
+
 /** Applies inline code / bold / italic / link styling to one line of text. */
 @Composable
-private fun inlineStyled(raw: String, color: Color): AnnotatedString {
+private fun inlineStyled(raw: String, color: Color, openLink: (String) -> Unit): AnnotatedString {
     if (!raw.contains('`') && !raw.contains('*') && !raw.contains('[')) {
         return AnnotatedString(raw)
     }
@@ -241,14 +265,24 @@ private fun inlineStyled(raw: String, color: Color): AnnotatedString {
             }
 
             else -> {
-                val link = LINK.find(v)
-                val label = link?.groupValues?.get(1).orEmpty()
-                withSpan(
-                    SpanStyle(
-                        color = linkColor,
-                        textDecoration = TextDecoration.Underline,
-                    )
-                ) { append(label) }
+                val (label, url) = linkLabelUrl(v) ?: (v to "")
+                if (url.isNotEmpty()) {
+                    withLink(LinkAnnotation.Clickable(url) { openLink(url) }) {
+                        withSpan(
+                            SpanStyle(
+                                color = linkColor,
+                                textDecoration = TextDecoration.Underline,
+                            )
+                        ) { append(label) }
+                    }
+                } else {
+                    withSpan(
+                        SpanStyle(
+                            color = linkColor,
+                            textDecoration = TextDecoration.Underline,
+                        )
+                    ) { append(label) }
+                }
             }
         }
         cursor = m.range.last + 1
