@@ -79,10 +79,12 @@ class RoomTranscriptTest {
     }
 
     // An unknown-outcome send is not settled by settleSend: the call failed, so
-    // there was no confirmation to swap in. The only way to learn that it landed
-    // is the next poll — and the log echoes the *server's* event_id, never the
-    // client's, so nothing can pair them by key.
-    @Test fun pollRetiresAnUnknownEchoThatTheRoomDidReceive() {
+    // there was no confirmation to swap in. The log echoes the *server's*
+    // event_id, never the client's, so nothing can pair them by key — and text
+    // is NOT a sound substitute: a later identical post would consume the echo
+    // and silently discard its retry entry. The echo survives (even next to its
+    // own delivered copy) until the id-reusing retry settles it.
+    @Test fun sameTextDoesNotRetireAnUnknownEcho() {
         val echo = RoomMessage(
             "local-1", Long.MAX_VALUE, "message", "default", "hi",
             mine = true, system = false,
@@ -93,12 +95,13 @@ class RoomTranscriptTest {
             mine = true, system = false,
         )
         val merged = mergeRoomMessages(listOf(echo), listOf(delivered))
-        assertEquals(listOf("user:hash"), merged.map { it.key })
+        assertEquals(listOf("user:hash", "local-1"), merged.map { it.key })
+        assertEquals(RoomSendState.Unknown, merged.last().sendState)
     }
 
-    // Two identical posts in flight: each log entry retires one echo, so the
-    // count still balances instead of leaving a stale retryable row behind.
-    @Test fun identicalUnknownEchoesArePairedOffOneForOne() {
+    // Two identical unknown posts stay retryable independently: nothing pairs
+    // them off against same-text rows, so neither loses its id.
+    @Test fun identicalUnknownEchoesBothStayRetryable() {
         val first = RoomMessage(
             "local-1", Long.MAX_VALUE, "message", "default", "hi",
             mine = true, system = false,
@@ -118,23 +121,6 @@ class RoomTranscriptTest {
                     mine = true, system = false),
             ),
         )
-        assertEquals(listOf("user:h1", "user:h2"), merged.map { it.key })
-    }
-
-    // Content alone must not retire an echo from someone else.
-    @Test fun aMemberReplyWithTheSameTextLeavesTheEchoAlone() {
-        val echo = RoomMessage(
-            "local-1", Long.MAX_VALUE, "message", "default", "hi",
-            mine = true, system = false,
-            sendState = RoomSendState.Unknown, eventId = "send-k1",
-        )
-        val fromMember = RoomMessage(
-            "user:h1", 9L, "message.member", "writer", "hi",
-            mine = false, system = false,
-        )
-        val merged = mergeRoomMessages(listOf(echo), listOf(fromMember))
-        // The echo survives - a member saying the same words is not our post.
-        // It sorts last for the same reason every pending echo does.
-        assertEquals(listOf("user:h1", "local-1"), merged.map { it.key })
+        assertEquals(listOf("user:h1", "user:h2", "local-1", "local-2"), merged.map { it.key })
     }
 }

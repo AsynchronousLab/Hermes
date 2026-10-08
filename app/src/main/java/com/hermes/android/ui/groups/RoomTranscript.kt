@@ -42,32 +42,22 @@ data class RoomMessage(
     val eventId: String? = null,
 )
 
-/** Confirmed events stay in sequence order; pending echoes remain at the tail. */
+/**
+ * Confirmed events stay in sequence order; pending echoes remain at the tail.
+ *
+ * Pairing is by KEY ONLY, on purpose. An unknown-outcome echo is never settled
+ * by matching its text against incoming rows: the log does not echo the client
+ * `event_id`, so text is the only join key available and it is not sound — a
+ * *later* post with identical wording would consume the echo and silently
+ * discard its retry entry. The echo settles through its own id-reusing retry
+ * (or stays honestly marked "unknown"), never through a guess.
+ */
 internal fun mergeRoomMessages(
     existing: List<RoomMessage>,
     incoming: List<RoomMessage>,
-): List<RoomMessage> {
-    // An unknown-outcome send is never settled by its own call: that call
-    // failed, so there was no confirmation to swap in. The poll is the only way
-    // to learn it landed — and the log carries the *server's* event_id, never
-    // the client's, so an echo cannot be paired by key. Content is the only
-    // link left: an inbound row of ours with the same text is that post
-    // arriving. Pair them off one-for-one so two identical posts still balance,
-    // and match on authorship so a member saying the same thing leaves the
-    // echo alone.
-    val unclaimed = incoming.filter { it.mine && !it.system }.toMutableList()
-    val kept = existing.filter { m ->
-        if (m.sendState != RoomSendState.Unknown || !m.mine) return@filter true
-        val idx = unclaimed.indexOfFirst { it.text == m.text }
-        if (idx < 0) true else {
-            unclaimed.removeAt(idx)
-            false
-        }
-    }
-    return (kept + incoming)
-        .distinctBy { it.key }
-        .sortedBy { it.seq }
-}
+): List<RoomMessage> = (existing + incoming)
+    .distinctBy { it.key }
+    .sortedBy { it.seq }
 
 /**
  * Whether a failed `groups.send` leaves delivery undecided.
