@@ -97,6 +97,10 @@ class ChatViewModel(
     private var nextKey = 1L
     private var nextAttachId = 1L
     private var eventJob: Job? = null
+    /** Initialize before init subscribes: Main.immediate can replay events inline. */
+    private val preBindEvents = ArrayDeque<RpcEvent>()
+    /** Shared by initial opening and connection recovery; never reset after subscriptions start. */
+    private var openJob: Job? = null
     private val historyMutex = Mutex()
     private var transcriptRevision = 0L
     private var requestRevision = 0L
@@ -156,9 +160,6 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
             loadAuxiliary()
         }
     }
-
-    /** In-flight session opens, single-slot: the initial open and every recovery retry share it. */
-    private var openJob: Job? = null
 
     /**
      * Opens the session once a connection exists.
@@ -347,9 +348,6 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
             }
         }
     }
-
-    /** Events seen before a session was bound; replayed right after binding. */
-    private val preBindEvents = ArrayDeque<RpcEvent>()
 
     private fun bindSession(sessionId: String, stored: String?, title: String) {
         sessionGeneration++
