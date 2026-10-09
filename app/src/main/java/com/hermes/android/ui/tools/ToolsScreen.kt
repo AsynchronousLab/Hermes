@@ -51,6 +51,7 @@ fun ToolsScreen(
                 TopAppBar(
                     title = { Text("更多", fontWeight = FontWeight.SemiBold) },
                     actions = {
+                        TextButton(onClick = onReload, enabled = !state.loading) { Text("刷新") }
                         TextButton(onClick = onOpenSettings) { Text("后端设置") }
                     },
                     colors = TopAppBarDefaults.topAppBarColors(

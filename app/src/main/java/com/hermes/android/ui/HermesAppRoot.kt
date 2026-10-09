@@ -12,7 +12,6 @@ import androidx.compose.material.icons.filled.People
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -35,6 +34,9 @@ import com.hermes.android.ui.chat.ChatScreen
 import com.hermes.android.ui.chat.ChatViewModel
 import com.hermes.android.ui.sessions.SessionListScreen
 import com.hermes.android.ui.sessions.SessionListViewModel
+import com.hermes.android.core.store.AppAppearance
+import com.hermes.android.core.store.ThemeMode
+import com.hermes.android.ui.settings.AppSettingsScreen
 import com.hermes.android.ui.settings.SettingsScreen
 import com.hermes.android.ui.settings.SettingsViewModel
 import com.hermes.android.ui.tools.ToolsScreen
@@ -44,6 +46,8 @@ private object Routes {
     const val CHATS = "chats"
     const val CONTACTS = "contacts"
     const val MORE = "more"
+    const val BACKEND = "backend-settings"
+    const val APP_SETTINGS = "app-settings"
     const val CHAT = "chat"
     const val ROOM = "room"
     fun chat(session: String?) =
@@ -67,7 +71,12 @@ private val TABS = listOf(
 )
 
 @Composable
-fun HermesAppRoot() {
+fun HermesAppRoot(
+    appearance: AppAppearance,
+    darkTheme: Boolean,
+    onTheme: (ThemeMode) -> Unit,
+    onFontScale: (Float) -> Unit,
+) {
     val app = androidx.compose.ui.platform.LocalContext.current.applicationContext as HermesApp
     val navController = rememberNavController()
     val backStack by navController.currentBackStackEntryAsState()
@@ -91,6 +100,10 @@ fun HermesAppRoot() {
                         NavigationBarItem(
                             selected = selected,
                             onClick = {
+                                // Settings are transient destinations, never saved as a tab's root.
+                                if (currentRoute == Routes.BACKEND || currentRoute == Routes.APP_SETTINGS) {
+                                    navController.popBackStack()
+                                }
                                 navController.navigate(spec.route) {
                                     popUpTo(navController.graph.findStartDestination().id) {
                                         saveState = true
@@ -135,7 +148,10 @@ fun HermesAppRoot() {
                     onNewSession = {
                         vm.newSession { sid -> navController.navigate(Routes.chat(sid)) }
                     },
-                    onOpenSettings = { navController.navigate(Routes.MORE) },
+                    onOpenSettings = { navController.navigate(Routes.APP_SETTINGS) { launchSingleTop = true } },
+                    onOpenBackend = { navController.navigate(Routes.BACKEND) { launchSingleTop = true } },
+                    darkTheme = darkTheme,
+                    onToggleTheme = { onTheme(if (darkTheme) ThemeMode.LIGHT else ThemeMode.DARK) },
                     onDismiss = vm::clearBanner,
                     onDelete = vm::delete,
                 )
@@ -173,38 +189,43 @@ fun HermesAppRoot() {
                     factory = ToolsViewModel.Factory(app.repository, app.settings)
                 )
                 val tools by toolsVm.state.collectAsState()
-                val settingsVm: SettingsViewModel = viewModel(
+                // Returning from backend settings also reloads the visible tab.
+                LaunchedEffect(Unit) { toolsVm.load() }
+                ToolsScreen(
+                    state = tools,
+                    onTab = toolsVm::selectTab,
+                    onReload = { toolsVm.load() },
+                    onBrowse = toolsVm::browse,
+                    onExpandToolset = toolsVm::expandToolset,
+                    onToggleToolset = toolsVm::toggleToolset,
+                    onOpenSkill = toolsVm::openSkill,
+                    onToggleSkill = toolsVm::toggleSkill,
+                    onOpenSettings = { navController.navigate(Routes.BACKEND) { launchSingleTop = true } },
+                    onCloseSkill = toolsVm::clearSkillDetail,
+                    onClear = toolsVm::clearMessage,
+                )
+            }
+
+            composable(Routes.BACKEND) {
+                val vm: SettingsViewModel = viewModel(
                     factory = SettingsViewModel.Factory(app.repository, app.settings)
                 )
-                val settings by settingsVm.state.collectAsState()
-                var showBackend by rememberSaveable { mutableStateOf(false) }
+                val state by vm.state.collectAsState()
+                SettingsScreen(
+                    state = state,
+                    onBaseUrl = vm::onBaseUrl,
+                    onUsername = vm::onUsername,
+                    onPassword = vm::onPassword,
+                    onTogglePassword = vm::togglePassword,
+                    onSave = vm::save,
+                    onTest = vm::testConnection,
+                    onBack = { navController.popBackStack() },
+                )
+            }
 
-                if (showBackend) {
-                    SettingsScreen(
-                        state = settings,
-                        onBaseUrl = settingsVm::onBaseUrl,
-                        onUsername = settingsVm::onUsername,
-                        onPassword = settingsVm::onPassword,
-                        onTogglePassword = settingsVm::togglePassword,
-                        onSave = settingsVm::save,
-                        onTest = settingsVm::testConnection,
-                        onBack = { showBackend = false },
-                    )
-                } else {
-                    ToolsScreen(
-                        state = tools,
-                        onTab = toolsVm::selectTab,
-                        onReload = { toolsVm.load() },
-                        onBrowse = toolsVm::browse,
-                        onExpandToolset = toolsVm::expandToolset,
-                        onToggleToolset = toolsVm::toggleToolset,
-                        onOpenSkill = toolsVm::openSkill,
-                        onToggleSkill = toolsVm::toggleSkill,
-                        onOpenSettings = { showBackend = true },
-                        onCloseSkill = toolsVm::clearSkillDetail,
-                        onClear = toolsVm::clearMessage,
-                    )
-                }
+            composable(Routes.APP_SETTINGS) {
+                AppSettingsScreen(appearance, onTheme, onFontScale,
+                    onBack = { navController.popBackStack() })
             }
 
             composable(Routes.CHAT) {

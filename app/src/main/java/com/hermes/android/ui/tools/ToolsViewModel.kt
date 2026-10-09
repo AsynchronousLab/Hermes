@@ -14,6 +14,9 @@ import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
+import com.hermes.android.core.net.RpcConnectionState
 
 /**
  * A contact is a Hermes **profile** — a distinct persona with its own model,
@@ -62,15 +65,29 @@ class ToolsViewModel(
 
     private val _state = MutableStateFlow(ToolsUiState())
     val state: StateFlow<ToolsUiState> = _state.asStateFlow()
+    private var cachedSessionId: String? = null
+    private var loadJob: Job? = null
+    private var loadSeq = 0L
+    private var browseSeq = 0L
 
     init {
-        load(ToolsUiState.Tab.SKILLS)
+        viewModelScope.launch {
+            repo.connection.collect { connection ->
+                if (connection == RpcConnectionState.Connected) load()
+                else {
+                    loadJob?.cancel()
+                    loadSeq++
+                    _state.update { it.copy(loading = false) }
+                }
+            }
+        }
         // An account/backend switch invalidates everything cached here: the
         // session id belongs to the old backend, and the lists are the old
         // account's. Drop both and reload rather than showing stale data.
         viewModelScope.launch {
             repo.configEpoch.drop(1).collect {
                 cachedSessionId = null
+                browseSeq++
                 _state.update {
                     it.copy(
                         skills = emptyList(),
@@ -92,41 +109,53 @@ class ToolsViewModel(
         load(tab)
     }
 
-    fun load(tab: ToolsUiState.Tab = _state.value.tab) = viewModelScope.launch {
-        _state.update { it.copy(loading = true, error = null) }
-        runCatching {
-            when (tab) {
-                ToolsUiState.Tab.SKILLS -> {
-                    val skills = repo.skills()
-                    _state.update { it.copy(skills = skills) }
-                }
+    fun load(tab: ToolsUiState.Tab = _state.value.tab) {
+        loadJob?.cancel()
+        val request = ++loadSeq
+        val epoch = repo.configEpoch.value
+        if (!repo.isConnected) {
+            _state.update { it.copy(loading = false, error = "请先在后端设置中连接后端") }
+            return
+        }
+        fun apply(change: (ToolsUiState) -> ToolsUiState) {
+            if (request == loadSeq && epoch == repo.configEpoch.value) _state.update(change)
+        }
+        loadJob = viewModelScope.launch {
+            _state.update { it.copy(loading = true, error = null) }
+            runCatching {
+                when (tab) {
+                    ToolsUiState.Tab.SKILLS -> {
+                        val skills = repo.skills()
+                        apply { it.copy(skills = skills) }
+                    }
 
-                ToolsUiState.Tab.TOOLS -> {
-                    val ts = repo.toolsDetailed()
-                    _state.update { it.copy(toolsets = ts) }
-                }
+                    ToolsUiState.Tab.TOOLS -> {
+                        val ts = repo.toolsDetailed()
+                        apply { it.copy(toolsets = ts) }
+                    }
 
-                ToolsUiState.Tab.FILES -> {
-                    val listing = repo.listFiles(_state.value.filePath)
-                    _state.update { it.updateFiles(listing) }
-                }
+                    ToolsUiState.Tab.FILES -> {
+                        val listing = repo.listFiles(_state.value.filePath)
+                        apply { it.updateFiles(listing) }
+                    }
 
-                ToolsUiState.Tab.CRON -> {
-                    val jobs = repo.cronJobs()
-                    _state.update { it.copy(cron = jobs) }
-                }
+                    ToolsUiState.Tab.CRON -> {
+                        val jobs = repo.cronJobs()
+                        apply { it.copy(cron = jobs) }
+                    }
 
-                ToolsUiState.Tab.AGENTS -> {
-                    val agents = runCatching { repo.agents() }.getOrDefault(emptyList())
-                    _state.update { it.copy(agents = agents) }
+                    ToolsUiState.Tab.AGENTS -> {
+                        val agents = repo.agents()
+                        apply { it.copy(agents = agents) }
+                    }
                 }
+            }.onFailure { t ->
+                if (t is CancellationException) throw t
+                apply { it.copy(error = t.friendly()) }
             }
-        }.onFailure { t -> _state.update { it.copy(error = t.friendly()) } }
-        _state.update { it.copy(loading = false) }
+            apply { it.copy(loading = false) }
+        }
     }
-
-    /** Monotonic request version: only the newest browse may write state. */
-    private var browseSeq = 0L
 
     fun browse(path: String) {
         val mySeq = ++browseSeq
@@ -175,7 +204,6 @@ class ToolsViewModel(
         )
     }
 
-    private var cachedSessionId: String? = null
 
     private suspend fun ensureSession(): String {
         cachedSessionId?.let { return it }

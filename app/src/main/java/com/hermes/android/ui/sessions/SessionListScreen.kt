@@ -16,6 +16,8 @@ import androidx.compose.material.icons.filled.Groups
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.DarkMode
+import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.filled.SmartToy
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
@@ -49,6 +51,9 @@ fun SessionListScreen(
     onOpenRoom: (String) -> Unit,
     onNewSession: () -> Unit,
     onOpenSettings: () -> Unit,
+    onOpenBackend: () -> Unit,
+    darkTheme: Boolean,
+    onToggleTheme: () -> Unit,
     onDismiss: () -> Unit,
     onDelete: (SessionSummary) -> Unit,
 ) {
@@ -81,8 +86,12 @@ fun SessionListScreen(
                 TopAppBar(
                     title = { Text("Hermes 会话", fontWeight = FontWeight.SemiBold) },
                     actions = {
+                        IconToggleButton(checked = darkTheme, onCheckedChange = { onToggleTheme() }) {
+                            Icon(if (darkTheme) Icons.Default.LightMode else Icons.Default.DarkMode,
+                                contentDescription = if (darkTheme) "切换浅色模式" else "切换深色模式")
+                        }
                         IconButton(onClick = onOpenSettings) {
-                            Icon(Icons.Default.Settings, contentDescription = "设置")
+                            Icon(Icons.Default.Settings, contentDescription = "程序设置")
                         }
                     },
                     colors = TopAppBarDefaults.topAppBarColors(
@@ -112,7 +121,7 @@ fun SessionListScreen(
                     CircularProgressIndicator()
                 }
 
-                state.needsSetup -> SetupPrompt(onOpenSettings)
+                state.needsSetup -> SetupPrompt(onOpenBackend)
 
                 state.visible.isEmpty() -> Box(Modifier.fillMaxSize(), Alignment.Center) {
                     Text(
@@ -196,7 +205,7 @@ private fun SetupPrompt(onOpenSettings: () -> Unit) {
         )
         Spacer(Modifier.height(18.dp))
         Button(onClick = onOpenSettings, shape = RoundedCornerShape(12.dp)) {
-            Text("去设置")
+            Text("绑定后端")
         }
     }
 }
@@ -367,16 +376,15 @@ private fun RoomRow(room: Group, onClick: () -> Unit) {
 
 @Composable
 private fun SourceTag(source: String) {
-    val label = when (source) {
-        "android" -> "Android"
+    val label = when (source.trim().lowercase(Locale.ROOT)) {
+        "android" -> "安卓"
         "cron" -> "定时"
         "desktop" -> "桌面"
         "feishu" -> "飞书"
         "qqbot" -> "QQ"
         "weixin" -> "微信"
         "telegram" -> "TG"
-        "tui" -> "TUI"
-        "cli" -> "CLI"
+        "tui", "cli" -> "命令行"
         else -> source
     }
     Box(

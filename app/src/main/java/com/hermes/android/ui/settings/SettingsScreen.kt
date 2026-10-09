@@ -82,6 +82,7 @@ fun SettingsScreen(
                 onValueChange = onBaseUrl,
                 label = { Text("后端地址") },
                 placeholder = { Text("http://192.168.1.10:9119") },
+                supportingText = { Text("例如 http://192.168.1.10:9119，使用正斜杠 /，支持 http:// 或 https://") },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),

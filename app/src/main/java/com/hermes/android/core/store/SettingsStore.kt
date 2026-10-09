@@ -5,6 +5,7 @@ import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.hermes.android.core.net.HermesConfig
 import kotlinx.coroutines.CoroutineScope
@@ -42,6 +43,8 @@ class SettingsStore(private val context: Context) {
     private val keyLastSession = stringPreferencesKey("last_session_id")
     private val keyLastStored = stringPreferencesKey("last_stored_session_id")
     private val keyReasoning = stringPreferencesKey("reasoning_level")
+    private val keyTheme = stringPreferencesKey("app_theme")
+    private val keyFontScale = floatPreferencesKey("app_font_scale")
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -94,6 +97,18 @@ class SettingsStore(private val context: Context) {
     val lastSessionId: Flow<String?> = context.dataStore.data.map { it[keyLastSession] }
     val lastStoredSessionId: Flow<String?> = context.dataStore.data.map { it[keyLastStored] }
     val reasoningLevel: Flow<String> = context.dataStore.data.map { it[keyReasoning] ?: "medium" }
+
+    val appearance: Flow<AppAppearance> = context.dataStore.data.map {
+        AppAppearance(ThemeMode.fromStored(it[keyTheme]), validFontScale(it[keyFontScale] ?: 1f))
+    }
+
+    suspend fun setTheme(mode: ThemeMode) {
+        context.dataStore.edit { it[keyTheme] = mode.name }
+    }
+
+    suspend fun setFontScale(scale: Float) {
+        context.dataStore.edit { it[keyFontScale] = validFontScale(scale) }
+    }
 
     /**
  * Persists the settings.
