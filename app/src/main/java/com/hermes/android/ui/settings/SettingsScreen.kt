@@ -1,6 +1,7 @@
 package com.hermes.android.ui.settings
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -24,6 +25,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.hermes.android.core.ConnectionTestResult
 import com.hermes.android.core.net.RpcConnectionState
+import com.hermes.android.core.net.ProxyType
 
 /**
  * Backend configuration with a real verification path: the test button walks
@@ -36,6 +38,9 @@ fun SettingsScreen(
     onBaseUrl: (String) -> Unit,
     onUsername: (String) -> Unit,
     onPassword: (String) -> Unit,
+    onProxyType: (ProxyType) -> Unit,
+    onProxyHost: (String) -> Unit,
+    onProxyPort: (String) -> Unit,
     onTogglePassword: () -> Unit,
     onSave: () -> Unit,
     onTest: () -> Unit,
@@ -119,6 +124,56 @@ fun SettingsScreen(
                 shape = RoundedCornerShape(12.dp),
             )
 
+            HorizontalDivider()
+            Text("网络代理（可选）", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "默认直连。启用后，健康检查、登录、文件请求和 WebSocket 都通过代理连接后端。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            listOf(
+                ProxyType.DIRECT to "不使用代理",
+                ProxyType.WEB to "Web（HTTP/HTTPS 代理）",
+                ProxyType.SOCKS to "SOCKS5 代理",
+            ).forEach { (type, label) ->
+                Row(
+                    Modifier.fillMaxWidth().clickable { onProxyType(type) },
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    RadioButton(selected = state.proxyType == type, onClick = null)
+                    Spacer(Modifier.width(8.dp))
+                    Text(label, style = MaterialTheme.typography.bodyMedium)
+                }
+            }
+            if (state.proxyType != ProxyType.DIRECT) {
+                OutlinedTextField(
+                    value = state.proxyHost,
+                    onValueChange = onProxyHost,
+                    label = { Text("代理主机") },
+                    placeholder = { Text("proxy.example.com") },
+                    supportingText = { Text("只填域名或 IP，不含协议、路径和端口") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                    shape = RoundedCornerShape(12.dp),
+                )
+                OutlinedTextField(
+                    value = state.proxyPort,
+                    onValueChange = onProxyPort,
+                    label = { Text("代理端口") },
+                    placeholder = { Text("7890") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    shape = RoundedCornerShape(12.dp),
+                )
+                Text(
+                    "当前支持无需账号密码的代理。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 OutlinedButton(
                     onClick = onSave,
@@ -163,7 +218,7 @@ fun SettingsScreen(
 
             HorizontalDivider()
             Text(
-                "客户端仅连接你配置的地址，不会上传任何数据到第三方。",
+                "未启用代理时直接连接后端；启用后经你配置的代理转发。",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.outline,
             )

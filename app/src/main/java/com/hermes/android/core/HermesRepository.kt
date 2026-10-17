@@ -4,6 +4,7 @@ import com.hermes.android.core.model.*
 import com.hermes.android.core.net.HermesAuth
 import com.hermes.android.core.net.HermesConfig
 import com.hermes.android.core.net.HermesHttp
+import com.hermes.android.core.net.HermesProxySelector
 import com.hermes.android.core.net.HermesRest
 import com.hermes.android.core.net.JsonRpcClient
 import com.hermes.android.core.net.SessionCookieJar
@@ -31,12 +32,16 @@ private const val ANDROID_SESSION_SOURCE = "android"
  *  - REST under `/api/…` → skills, cron, files, messaging, pairing
  */
 class HermesRepository {
-    private val jar = SessionCookieJar()
-    private val client: OkHttpClient = HermesHttp.client(jar, debug = false)
-    private val auth = HermesAuth(jar, client)
-
     @Volatile var config: HermesConfig = HermesConfig()
         private set
+
+    private val jar = SessionCookieJar()
+    private val client: OkHttpClient = HermesHttp.client(
+        jar,
+        debug = false,
+        proxySelector = HermesProxySelector { config.proxy },
+    )
+    private val auth = HermesAuth(jar, client)
 
     val rpc = JsonRpcClient(client, auth)
     val rest = HermesRest(client) { config }
@@ -83,9 +88,11 @@ class HermesRepository {
      * sent after a switch could still land on the previous backend.
      */
     suspend fun updateConfig(cfg: HermesConfig) {
+        val next = cfg.copy(proxy = cfg.proxy.normalized())
         val changed = cfg.normalizedBaseUrl != config.normalizedBaseUrl ||
-            cfg.username != config.username
-        config = cfg
+            cfg.username != config.username || cfg.password != config.password ||
+            next.proxy != config.proxy
+        config = next
         if (changed) {
             // Same lock the login commit takes, so a switch cannot land
             // between a login's epoch check and its absorb.
@@ -95,6 +102,7 @@ class HermesRepository {
             }
             jar.clear()
             rpc.disconnect()
+            client.connectionPool.evictAll()
             _configEpoch.value++
         }
     }
@@ -192,6 +200,7 @@ class HermesRepository {
     /** Logs in if needed, then opens the WebSocket. Returns the failure if any. */
     suspend fun connect(force: Boolean = false): Result<Unit> {
         val cfg = config
+        cfg.proxy.validationError()?.let { return Result.failure(IllegalArgumentException(it)) }
         if (!cfg.isComplete) {
             return Result.failure(IllegalStateException("请先在设置中填写后端地址和账号"))
         }
@@ -229,6 +238,7 @@ class HermesRepository {
 
     /** Settings screen "test connection": login → ticket → ws → ping. */
     suspend fun testConnection(): ConnectionTestResult {
+        config.proxy.validationError()?.let { return ConnectionTestResult.Failed(it) }
         if (!config.isComplete) return ConnectionTestResult.Failed("请填写后端地址、用户名和密码")
         val started = System.currentTimeMillis()
 

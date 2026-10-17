@@ -6,6 +6,8 @@ import androidx.lifecycle.viewModelScope
 import com.hermes.android.core.ConnectionTestResult
 import com.hermes.android.core.HermesRepository
 import com.hermes.android.core.net.HermesConfig
+import com.hermes.android.core.net.HermesProxy
+import com.hermes.android.core.net.ProxyType
 import com.hermes.android.core.net.RpcConnectionState
 import com.hermes.android.core.store.SettingsStore
 import com.hermes.android.ui.chat.friendly
@@ -20,6 +22,9 @@ data class SettingsUiState(
     val baseUrl: String = "",
     val username: String = "",
     val password: String = "",
+    val proxyType: ProxyType = ProxyType.DIRECT,
+    val proxyHost: String = "",
+    val proxyPort: String = "",
     val showPassword: Boolean = false,
     val testing: Boolean = false,
     val result: ConnectionTestResult? = null,
@@ -31,9 +36,13 @@ data class SettingsUiState(
     /** Set once the user edits any field, so async load never clobbers typing. */
     val dirty: Boolean = false,
 ) {
-    val config: HermesConfig get() = HermesConfig(baseUrl, username, password)
+    val config: HermesConfig get() = HermesConfig(
+        baseUrl, username, password,
+        HermesProxy(proxyType, proxyHost, proxyPort.trim().toIntOrNull() ?: 0),
+    )
     val canTest: Boolean
-        get() = !testing && baseUrl.isNotBlank() && username.isNotBlank() && password.isNotBlank()
+        get() = !testing && baseUrl.isNotBlank() && username.isNotBlank() &&
+            password.isNotBlank() && config.proxy.validationError() == null
 }
 
 /** Settings: enter the backend address, then verify it end to end. */
@@ -60,7 +69,11 @@ class SettingsViewModel(
                     baseUrl = cfg.baseUrl,
                     username = cfg.username,
                     password = cfg.password,
+                    proxyType = cfg.proxy.type,
+                    proxyHost = cfg.proxy.host,
+                    proxyPort = cfg.proxy.port.takeIf { it != 0 }?.toString().orEmpty(),
                     connection = repo.connection.value,
+                    error = cfg.proxy.validationError(),
                 )
             }
             // Only connect if the shared socket is not already up. This screen is opened
@@ -107,10 +120,26 @@ class SettingsViewModel(
         it.copy(password = v, result = null, saved = false, dirty = true, error = null)
     }
 
+    fun onProxyType(v: ProxyType) = _state.update {
+        it.copy(proxyType = v, result = null, saved = false, dirty = true, error = null)
+    }
+
+    fun onProxyHost(v: String) = _state.update {
+        it.copy(proxyHost = v, result = null, saved = false, dirty = true, error = null)
+    }
+
+    fun onProxyPort(v: String) = _state.update {
+        it.copy(proxyPort = v, result = null, saved = false, dirty = true, error = null)
+    }
+
     fun togglePassword() = _state.update { it.copy(showPassword = !it.showPassword) }
 
     fun save() = viewModelScope.launch {
         val cfg = _state.value.config
+        cfg.proxy.validationError()?.let { message ->
+            _state.update { it.copy(saved = false, error = message) }
+            return@launch
+        }
         _state.update { it.copy(saved = false, error = null) }
         val ok = runCatching { settings.save(cfg) }
             .onFailure { t -> _state.update { s -> s.copy(error = "保存失败：${t.message}") } }
@@ -131,6 +160,10 @@ class SettingsViewModel(
         // save and the handshake are still running.
         if (_state.value.testing) return@launch
         val cfg = _state.value.config
+        cfg.proxy.validationError()?.let { message ->
+            _state.update { it.copy(error = message) }
+            return@launch
+        }
         _state.update { it.copy(testing = true, result = null, saved = false, error = null) }
         try {
             val saved = runCatching { settings.save(cfg) }.getOrDefault(false)

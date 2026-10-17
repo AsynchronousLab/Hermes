@@ -6,8 +6,11 @@ import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.core.floatPreferencesKey
+import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.hermes.android.core.net.HermesConfig
+import com.hermes.android.core.net.HermesProxy
+import com.hermes.android.core.net.ProxyType
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -37,6 +40,9 @@ class SettingsStore(private val context: Context) {
     private val keyBaseUrl = stringPreferencesKey("base_url")
     private val keyUsername = stringPreferencesKey("username")
     private val keyPassword = stringPreferencesKey("password_enc")
+    private val keyProxyType = stringPreferencesKey("proxy_type")
+    private val keyProxyHost = stringPreferencesKey("proxy_host")
+    private val keyProxyPort = intPreferencesKey("proxy_port")
 
     /** Pre-encryption key from older builds; dropped on first load. */
     private val keyLegacyPassword = stringPreferencesKey("password")
@@ -89,6 +95,14 @@ class SettingsStore(private val context: Context) {
                     // An unreadable payload (lost keystore key) yields an empty
                     // password, which surfaces in Settings as "fill it in again".
                     password = p[keyPassword]?.let { cipher.decrypt(it) }.orEmpty(),
+                    proxy = HermesProxy(
+                        type = p[keyProxyType]?.let { saved ->
+                            runCatching { ProxyType.valueOf(saved) }
+                                .getOrDefault(ProxyType.UNSUPPORTED)
+                        } ?: ProxyType.DIRECT,
+                        host = p[keyProxyHost].orEmpty(),
+                        port = p[keyProxyPort] ?: 0,
+                    ).normalized(),
                 )
             }
         )
@@ -121,6 +135,7 @@ class SettingsStore(private val context: Context) {
  * Returns false when the password could not be encrypted.
  */
     suspend fun save(cfg: HermesConfig): Boolean {
+        require(cfg.proxy.validationError() == null) { cfg.proxy.validationError().orEmpty() }
         val encPassword =
             if (cfg.password.isEmpty()) "" else cipher.encrypt(cfg.password).orEmpty()
         if (cfg.password.isNotEmpty() && encPassword.isEmpty()) return false
@@ -129,6 +144,16 @@ class SettingsStore(private val context: Context) {
             p[keyBaseUrl] = cfg.baseUrl.trim()
             p[keyUsername] = cfg.username
             if (encPassword.isEmpty()) p.remove(keyPassword) else p[keyPassword] = encPassword
+            val proxy = cfg.proxy.normalized()
+            if (proxy.type == ProxyType.DIRECT) {
+                p.remove(keyProxyType)
+                p.remove(keyProxyHost)
+                p.remove(keyProxyPort)
+            } else {
+                p[keyProxyType] = proxy.type.name
+                p[keyProxyHost] = proxy.host
+                p[keyProxyPort] = proxy.port
+            }
             p.remove(keyLegacyPassword)
         }
         return true

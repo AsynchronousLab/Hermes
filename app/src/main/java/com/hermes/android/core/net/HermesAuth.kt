@@ -14,13 +14,59 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import java.net.InetSocketAddress
+import java.net.Proxy
+import java.net.ProxySelector
+import java.net.SocketAddress
+import java.net.URI
 import java.util.concurrent.TimeUnit
+
+enum class ProxyType { DIRECT, WEB, SOCKS, UNSUPPORTED }
+
+/** Optional gateway proxy. WEB uses HTTP proxying (including CONNECT for HTTPS/WSS). */
+data class HermesProxy(
+    val type: ProxyType = ProxyType.DIRECT,
+    val host: String = "",
+    val port: Int = 0,
+) {
+    val normalizedHost: String get() = host.trim().removeSurrounding("[", "]")
+
+    fun validationError(): String? {
+        if (type == ProxyType.DIRECT) return null
+        if (type == ProxyType.UNSUPPORTED) return "代理类型无效，请重新选择"
+        val h = normalizedHost
+        if (h.isEmpty()) return "请填写代理主机"
+        if (h.any { it.isWhitespace() || it == '/' || it == '@' } || h.contains("://") ||
+            (h.count { it == ':' } == 1)
+        ) return "代理主机只填域名或 IP，不要包含协议或端口"
+        if (port !in 1..65535) return "代理端口应在 1–65535 之间"
+        return null
+    }
+
+    /** Direct settings carry no dormant proxy address into connection comparisons. */
+    fun normalized(): HermesProxy = if (type == ProxyType.DIRECT) HermesProxy()
+        else copy(host = normalizedHost)
+}
+
+/** Reads the current config for each new connection, including REST and WebSocket routes. */
+class HermesProxySelector(private val current: () -> HermesProxy) : ProxySelector() {
+    override fun select(uri: URI): List<Proxy> {
+        val proxy = current().normalized()
+        if (proxy.type == ProxyType.DIRECT) return listOf(Proxy.NO_PROXY)
+        require(proxy.validationError() == null) { proxy.validationError().orEmpty() }
+        val type = if (proxy.type == ProxyType.WEB) Proxy.Type.HTTP else Proxy.Type.SOCKS
+        return listOf(Proxy(type, InetSocketAddress.createUnresolved(proxy.host, proxy.port)))
+    }
+
+    override fun connectFailed(uri: URI, sa: SocketAddress, ioe: java.io.IOException) = Unit
+}
 
 /** Everything the user can type into Settings. */
 data class HermesConfig(
     val baseUrl: String = "",
     val username: String = "",
     val password: String = "",
+    val proxy: HermesProxy = HermesProxy(),
 ) {
     /** Normalised `http://host:port` with no trailing slash. */
     val normalizedBaseUrl: String get() = baseUrl.trim().trimEnd('/')
@@ -29,7 +75,7 @@ data class HermesConfig(
     val isComplete: Boolean
         get() = hostUrl != null &&
             username.isNotBlank() &&
-            password.isNotEmpty()
+            password.isNotEmpty() && proxy.validationError() == null
 
     val hostUrl: HttpUrl? get() = normalizedBaseUrl.toHttpUrlOrNull()
 
@@ -121,9 +167,14 @@ object HermesHttp {
 
     val jsonMedia = "application/json; charset=utf-8".toMediaType()
 
-    fun client(jar: SessionCookieJar, debug: Boolean = false): OkHttpClient =
+    fun client(
+        jar: SessionCookieJar,
+        debug: Boolean = false,
+        proxySelector: ProxySelector = HermesProxySelector { HermesProxy() },
+    ): OkHttpClient =
         OkHttpClient.Builder()
             .cookieJar(jar)
+            .proxySelector(proxySelector)
             .connectTimeout(12, TimeUnit.SECONDS)
             .readTimeout(30, TimeUnit.SECONDS)
             .writeTimeout(30, TimeUnit.SECONDS)
