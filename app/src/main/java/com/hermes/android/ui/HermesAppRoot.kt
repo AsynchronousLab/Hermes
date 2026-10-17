@@ -53,8 +53,11 @@ private object Routes {
     const val APP_SETTINGS = "app-settings"
     const val CHAT = "chat"
     const val ROOM = "room"
-    fun chat(session: String?) =
-        if (session == null) CHAT else "$CHAT?session=${android.net.Uri.encode(session)}"
+    fun chat(session: String?, title: String? = null) =
+        if (session == null) CHAT else buildString {
+            append("$CHAT?session=${android.net.Uri.encode(session)}")
+            if (title != null) append("&title=${android.net.Uri.encode(title)}")
+        }
 
     /**
      * A group room. `self` is the profile whose identity `groups.send` posts
@@ -144,7 +147,9 @@ fun HermesAppRoot(
                     state = state,
                     onSearch = vm::search,
                     onRefresh = { vm.refresh() },
-                    onOpen = { s -> vm.open(s) { route -> navController.navigate(Routes.chat(route)) } },
+                    onOpen = { s -> vm.open(s) { route, title ->
+                        navController.navigate(Routes.chat(route, title))
+                    } },
                     onOpenRoom = { roomId ->
                         navController.navigate(Routes.room(roomId, "default"))
                     },
@@ -247,18 +252,24 @@ fun HermesAppRoot(
             }
 
             composable(
-                route = "${Routes.CHAT}?session={session}",
+                route = "${Routes.CHAT}?session={session}&title={title}",
                 arguments = listOf(
                     navArgument("session") {
                         type = NavType.StringType
                         nullable = true
                         defaultValue = null
-                    }
+                    },
+                    navArgument("title") {
+                        type = NavType.StringType
+                        nullable = true
+                        defaultValue = null
+                    },
                 ),
             ) { entry ->
                 val session = entry.arguments?.getString("session")
+                val title = entry.arguments?.getString("title")
                 val vm: ChatViewModel = viewModel(
-                    factory = ChatViewModel.Factory(app.repository, app.settings, session)
+                    factory = ChatViewModel.Factory(app.repository, app.settings, session, title)
                 )
                 ChatRoute(vm = vm, navController = navController, onBack = { navController.popBackStack() })
             }

@@ -103,6 +103,7 @@ data class ChatUiState(
     val notice: String? = null,
     val error: String? = null,
     val loading: Boolean = true,
+    val historyLoading: Boolean = false,
     val pending: List<PendingAttachment> = emptyList(),
     val uploading: Boolean = false,
     val listening: Boolean = false,

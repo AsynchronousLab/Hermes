@@ -27,6 +27,7 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
@@ -201,11 +202,9 @@ fun ChatScreen(
 
         Box(Modifier.weight(1f).fillMaxWidth()) {
             when {
-                state.loading -> Box(Modifier.fillMaxSize(), Alignment.Center) {
-                    CircularProgressIndicator()
+                transcript.isEmpty() -> {
+                    if (!state.loading && !state.historyLoading) EmptyTranscript(state.title)
                 }
-
-                transcript.isEmpty() -> EmptyTranscript(state.title)
 
                 else -> {
                     // ── 定位按钮 ──────────────────────────────────────────
@@ -320,6 +319,13 @@ fun ChatScreen(
                         }
                     }
                 }
+            }
+            if (state.loading || state.historyLoading) {
+                LinearProgressIndicator(
+                    modifier = Modifier.align(Alignment.TopCenter).fillMaxWidth().height(2.dp),
+                    color = MaterialTheme.colorScheme.primary.copy(alpha = 0.55f),
+                    trackColor = Color.Transparent,
+                )
             }
         }
 
@@ -1011,7 +1017,7 @@ private fun Composer(
     onRemoveAttachment: (Long) -> Unit,
     onVoice: () -> Unit,
 ) {
-    Surface(tonalElevation = 3.dp, color = MaterialTheme.colorScheme.surface) {
+    Surface(tonalElevation = 0.dp, color = MaterialTheme.colorScheme.background) {
         Column(
             Modifier
                 .fillMaxWidth()
@@ -1085,6 +1091,11 @@ private fun Composer(
                     maxLines = 6,
                     shape = RoundedCornerShape(20.dp),
                     textStyle = MaterialTheme.typography.bodyLarge,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedContainerColor = MaterialTheme.colorScheme.background,
+                        unfocusedContainerColor = MaterialTheme.colorScheme.background,
+                        disabledContainerColor = MaterialTheme.colorScheme.background,
+                    ),
                 )
                 Spacer(Modifier.width(6.dp))
                 FilledIconButton(

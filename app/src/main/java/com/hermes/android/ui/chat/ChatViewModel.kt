@@ -81,9 +81,13 @@ class ChatViewModel(
     private val repo: HermesRepository,
     private val settings: SettingsStore,
     private val sessionToOpen: String?,
+    private val initialTitle: String? = null,
 ) : ViewModel() {
 
-    private val _state = MutableStateFlow(ChatUiState())
+    private val _state = MutableStateFlow(ChatUiState(
+        title = initialTitle?.takeIf { it.isNotBlank() }
+            ?: if (sessionToOpen?.startsWith("resume:") == true) "未命名会话" else "新会话",
+    ))
     val state: StateFlow<ChatUiState> = _state.asStateFlow()
 
     /**
@@ -310,8 +314,10 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
 
                 Target.STORED -> {
                     val r = repo.resumeSession(id.orEmpty())
-                    bindSession(r.sessionId, r.storedSessionId, "会话")
+                    val title = initialTitle?.takeIf { it.isNotBlank() } ?: "未命名会话"
+                    bindSession(r.sessionId, r.storedSessionId, title)
                     settings.rememberSession(r.sessionId, r.storedSessionId)
+                    if (initialTitle.isNullOrBlank()) refreshStoredTitle(id.orEmpty(), r.sessionId)
                     loadHistory(r.sessionId)
                 }
 
@@ -338,9 +344,29 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
         _state.update { it.copy(loading = false) }
     }
 
+    /** Resolve a stored deep link that did not carry the list row's title. */
+    private fun refreshStoredTitle(storedId: String, runtimeId: String) {
+        val gen = sessionGeneration
+        viewModelScope.launch {
+            try {
+                val title = repo.listSessions().firstOrNull { it.id == storedId }?.displayTitle
+                    ?: return@launch
+                if (gen == sessionGeneration) _state.update { s ->
+                    if (s.sessionId == runtimeId && s.title == "未命名会话") s.copy(title = title) else s
+                }
+            } catch (t: CancellationException) {
+                throw t
+            } catch (_: Throwable) {
+                // The session remains usable even if its optional title lookup fails.
+            }
+        }
+    }
+
     private suspend fun loadHistory(sessionId: String): Boolean {
         val gen = sessionGeneration
         return historyMutex.withLock {
+            if (gen != sessionGeneration || _state.value.sessionId != sessionId) return@withLock false
+            _state.update { it.copy(historyLoading = true) }
             try {
                 val res = readStableSnapshot(
                     isCurrent = { gen == sessionGeneration && _state.value.sessionId == sessionId && repo.isConnected },
@@ -376,6 +402,8 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
                     _state.update { it.copy(error = "读取历史失败：${t.friendly()}") }
                 }
                 false
+            } finally {
+                if (gen == sessionGeneration) _state.update { it.copy(historyLoading = false) }
             }
         }
     }
@@ -1119,10 +1147,11 @@ fun respondToRequest(request: ServerRequest, choice: String) = viewModelScope.la
         private val repo: HermesRepository,
         private val settings: SettingsStore,
         private val sessionToOpen: String?,
+        private val initialTitle: String? = null,
     ) : ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
         override fun <T : ViewModel> create(modelClass: Class<T>): T =
-            ChatViewModel(repo, settings, sessionToOpen) as T
+            ChatViewModel(repo, settings, sessionToOpen, initialTitle) as T
     }
 }
 

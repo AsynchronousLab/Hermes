@@ -5,6 +5,7 @@ import com.hermes.android.core.HermesRepository
 import com.hermes.android.core.model.SessionCreated
 import com.hermes.android.core.model.SessionEventsResult
 import com.hermes.android.core.model.SessionMessagesResult
+import com.hermes.android.core.model.SessionSummary
 import com.hermes.android.core.net.JsonRpcClient
 import com.hermes.android.core.net.RpcConnectionState
 import com.hermes.android.core.net.RpcEvent
@@ -30,9 +31,11 @@ import org.mockito.Mockito.`when`
 class ChatInitializationTest {
     @Test fun openingNewlyCreatedSessionWithBufferedEventsDoesNotCrash() = open("runtime")
 
-    @Test fun openingStoredSessionWithBufferedEventsDoesNotCrash() = open("resume:stored")
+    @Test fun openingStoredSessionShowsItsName() = open("resume:stored", "会话名称")
 
-    private fun open(target: String) = runTest {
+    @Test fun storedDeepLinkLooksUpItsName() = open("resume:stored", expectedTitle = "会话名称")
+
+    private fun open(target: String, initialTitle: String? = null, expectedTitle: String? = initialTitle) = runTest {
         // Main.immediate on Android runs replay collectors inside the constructor.
         // A queued dispatcher would hide this initialization-order bug.
         Dispatchers.setMain(UnconfinedTestDispatcher(testScheduler))
@@ -50,18 +53,21 @@ class ChatInitializationTest {
             `when`(rpc.eventLossVersion).thenReturn(MutableStateFlow(0L))
             `when`(settings.reasoningLevel).thenReturn(flowOf("medium"))
             `when`(repo.resumeSession("stored")).thenReturn(SessionCreated("runtime", "stored"))
+            `when`(repo.listSessions()).thenReturn(listOf(SessionSummary("stored", "会话名称")))
             `when`(repo.history("runtime")).thenReturn(SessionMessagesResult())
             `when`(repo.sessionEvents()).thenReturn(SessionEventsResult())
             `when`(repo.modelOptions()).thenReturn(emptyList())
             `when`(repo.commands()).thenReturn(emptyList())
 
-            val vm = ChatViewModel(repo, settings, target)
+            val vm = ChatViewModel(repo, settings, target, initialTitle)
             store.put("chat", vm)
             // Verify replay made it through binding, not just that it was dropped.
             assertEquals("runtime", vm.state.value.sessionId)
             assertEquals(1, vm.state.value.messages.size)
             advanceUntilIdle()
             assertFalse(vm.state.value.loading)
+            assertFalse(vm.state.value.historyLoading)
+            expectedTitle?.let { assertEquals(it, vm.state.value.title) }
         } finally {
             store.clear()
             Dispatchers.resetMain()

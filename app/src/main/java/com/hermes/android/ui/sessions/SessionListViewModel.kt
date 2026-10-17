@@ -181,12 +181,12 @@ class SessionListViewModel(
     }
 
     /** Open a stored session: the gateway wants the durable id for `session.resume`. */
-    fun open(s: SessionSummary, navigate: (String) -> Unit) {
+    fun open(s: SessionSummary, navigate: (String, String) -> Unit) {
         viewModelScope.launch {
             runCatching { repo.resumeSession(s.id) }.fold(
                 onSuccess = { c ->
                     settings.rememberSession(c.sessionId, c.storedSessionId)
-                    navigate("resume:${s.id}")
+                    navigate("resume:${s.id}", s.displayTitle)
                 },
                 onFailure = { t ->
                     // Stay on the list instead of navigating. The chat screen
