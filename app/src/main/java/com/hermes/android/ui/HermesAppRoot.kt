@@ -15,6 +15,9 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.hermes.android.ui.chat.HermesSpeaker
 import com.hermes.android.ui.contacts.ContactsScreen
 import com.hermes.android.ui.contacts.ContactsViewModel
@@ -295,6 +298,14 @@ private fun ChatRoute(
     onBack: () -> Unit,
 ) {
     val state by vm.state.collectAsState()
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, vm) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) vm.onForeground()
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
     val context = androidx.compose.ui.platform.LocalContext.current
     var showModels by remember { mutableStateOf(false) }
     var showReasoning by remember { mutableStateOf(false) }
@@ -328,6 +339,7 @@ private fun ChatRoute(
     ChatScreen(
         state = state,
         onSend = vm::send,
+        onRetrySend = vm::retrySend,
         onPickModel = { showModels = true },
         onPickReasoning = { showReasoning = true },
         onForkFrom = { msg -> vm.forkFrom(msg) },

@@ -16,6 +16,7 @@ import com.hermes.android.core.net.RpcFailure
 import com.hermes.android.core.store.SettingsStore
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -101,6 +102,7 @@ class ChatViewModel(
     private val preBindEvents = ArrayDeque<RpcEvent>()
     /** Shared by initial opening and connection recovery; never reset after subscriptions start. */
     private var openJob: Job? = null
+    private var foregroundJob: Job? = null
     private val historyMutex = Mutex()
     private var transcriptRevision = 0L
     private var requestRevision = 0L
@@ -108,6 +110,13 @@ class ChatViewModel(
     private var historyRecoveryJob: Job? = null
     private var refreshAfterTurn = false
     private val pendingSendKeys = mutableSetOf<Long>()
+    private data class BufferedSend(
+        val sessionId: String,
+        val composed: String,
+        val attachments: List<PendingAttachment>,
+    )
+    private val sendBuffer = mutableMapOf<Long, BufferedSend>()
+    private val sendJobs = mutableMapOf<Long, Job>()
 
     /** True while a tool call means no text segment is open. */
     private var segmentOpen = false
@@ -183,6 +192,28 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
             .onSuccess { list -> _state.update { s -> s.copy(models = list) } }
         runCatching { repo.commands() }
             .onSuccess { list -> _state.update { s -> s.copy(commands = list) } }
+    }
+
+    /** A screen wake can leave a half-open socket looking Connected until its next ping. */
+    fun onForeground() {
+        if (foregroundJob?.isActive == true) return
+        foregroundJob = viewModelScope.launch {
+            val cfg = settings.config.first()
+            if (!cfg.isComplete) return@launch
+            if (!repo.config.isComplete) repo.updateConfig(cfg)
+            if (repo.isConnected) {
+                val alive = runCatching {
+                    repo.rpc.rpcRaw("gateway.ping", timeoutMs = 4_000)
+                }.isSuccess
+                if (alive) return@launch
+                repo.rpc.reconnectNow(repo.config)
+            } else if (repo.connection.value == RpcConnectionState.Reconnecting ||
+                repo.connection.value == RpcConnectionState.Connecting) {
+                repo.rpc.reconnectNow(repo.config)
+            } else {
+                repo.connect().onFailure { repo.rpc.reconnectNow(repo.config) }
+            }
+        }
     }
 
     private fun observeConnection() = viewModelScope.launch {
@@ -355,6 +386,9 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
         requestRecoveryJob?.cancel()
         refreshAfterTurn = false
         pendingSendKeys.clear()
+        sendJobs.values.forEach { it.cancel() }
+        sendJobs.clear()
+        sendBuffer.clear()
         segmentOpen = false
         _state.update {
             // Reset every session-scoped field: carrying messages or a pending
@@ -676,6 +710,7 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
      * dropped because there was no session id to submit against.
      */
     fun send(text: String): Boolean {
+        if (pendingSendKeys.isNotEmpty()) return false
         val sid = _state.value.sessionId
         if (sid == null) {
             _state.update { it.copy(error = "会话尚未就绪，请稍候再发送") }
@@ -702,6 +737,7 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
         // immediately. `delivered = false` until the gateway has it, so a failed
         // send reads as "未发送" instead of looking like a delivered message.
         val bubbleKey = nextKey++
+        sendBuffer[bubbleKey] = BufferedSend(sid, composed, pending)
         pendingSendKeys.add(bubbleKey)
         transcriptRevision++
         _state.update {
@@ -712,79 +748,82 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
                     text = composed,
                     attachments = refs,
                     delivered = false,
+                    sending = true,
                 ),
+                pending = it.pending.filterNot { item -> pending.any { it.id == item.id } },
                 error = null,
             )
         }
+        dispatchBufferedSend(bubbleKey)
+        return true
+    }
 
-        viewModelScope.launch {
+    /** Retry the same bubble with the bytes and words captured on first send. */
+    fun retrySend(key: Long) {
+        val item = sendBuffer[key] ?: return
+        if (item.sessionId != _state.value.sessionId || pendingSendKeys.isNotEmpty()) return
+        pendingSendKeys.add(key)
+        _state.update { s -> s.copy(error = null, messages = s.messages.map { m ->
+            if (m.key == key) m.copy(sending = true, deliveryUnknown = false) else m
+        }) }
+        dispatchBufferedSend(key)
+    }
+
+    private fun dispatchBufferedSend(key: Long) {
+        val job = viewModelScope.launch(start = CoroutineStart.LAZY) {
             val gen = sessionGeneration
             try {
-                val batchIds = pending.map { it.id }
-                // Attachments first: the marker in the text only resolves once the
-                // bytes are on the backend. If any upload fails, do NOT submit — the
-                // prompt would reference files the server never received, and the
-                // user loses the chance to retry.
-                val failures = uploadPending(sid, pending)
+                val item = sendBuffer[key] ?: return@launch
+                val failures = uploadBuffered(key, item)
                 if (gen != sessionGeneration) return@launch
                 if (failures.isNotEmpty()) {
-                    // The whole task stays staged — uploaded ones flagged, failed
-                    // ones not — and the words go back to the composer, so the
-                    // retry re-submits the *complete* prompt, not just the files
-                    // that failed.
-                    _state.update {
-                        it.copy(
-                            error = "附件上传失败，已保留待发送附件：\n" + failures.joinToString("\n"),
-                            restoreDraft = trimmed,
-                        )
-                    }
+                    _state.update { s -> s.copy(
+                        error = "附件上传失败，可点消息重试：\n" + failures.joinToString("\n"),
+                        messages = s.messages.map { m -> if (m.key == key) m.copy(sending = false) else m },
+                    ) }
                     return@launch
                 }
-                runCatching { repo.submitPrompt(sid, composed) }.fold(
+                runCatching { repo.submitPrompt(item.sessionId, item.composed) }.fold(
                     onSuccess = {
                         if (gen != sessionGeneration) return@fold
-                        markDelivered(bubbleKey)
-                        // The task is complete: drop exactly this batch from
-                        // staging — the user may have staged new files while the
-                        // send was still in flight.
-                        _state.update { s ->
-                            s.copy(pending = s.pending.filterNot { it.id in batchIds })
-                        }
+                        sendBuffer.remove(key)
+                        markDelivered(key)
                     },
                     onFailure = { t ->
                         if (gen != sessionGeneration) return@fold
-                        _state.update {
-                            it.copy(
-                                error = t.friendly(),
-                                streaming = false,
-                                restoreDraft = trimmed,
-                                messages = it.messages.map { m ->
-                                    if (m.key == bubbleKey) m.copy(delivered = false) else m
-                                },
-                            )
-                        }
+                        _state.update { s -> s.copy(
+                            error = t.friendly(),
+                            streaming = false,
+                            messages = s.messages.map { m ->
+                                if (m.key == key) m.copy(
+                                    sending = false,
+                                    deliveryUnknown = t is RpcFailure.Timeout ||
+                                        t is RpcFailure.ConnectionClosed,
+                                ) else m
+                            },
+                        ) }
                     },
                 )
             } finally {
-                pendingSendKeys.remove(bubbleKey)
+                pendingSendKeys.remove(key)
+                sendJobs.remove(key)
                 transcriptRevision++
             }
         }
-        return true
+        sendJobs[key] = job
+        job.start()
     }
 
     /** Flips a user bubble to its delivered state once the gateway accepted it. */
     private fun markDelivered(key: Long) {
         transcriptRevision++
         _state.update { s ->
-            s.copy(messages = s.messages.map { if (it.key == key) it.copy(delivered = true) else it })
+            s.copy(messages = s.messages.map { if (it.key == key) it.copy(delivered = true, sending = false) else it })
         }
     }
 
-    private suspend fun uploadPending(
-        sessionId: String,
-        pending: List<PendingAttachment>,
-    ): List<String> {
+    private suspend fun uploadBuffered(key: Long, item: BufferedSend): List<String> {
+        val pending = item.attachments
         if (pending.isEmpty()) return emptyList()
         _state.update { it.copy(uploading = true) }
         val errors = mutableListOf<String>()
@@ -799,22 +838,21 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
                 AttachmentRef.Kind.FILE -> com.hermes.android.core.AttachmentKind.FILE
             }
             val result = runCatching {
-                repo.attach(sessionId, a.name, kind, a.mime, a.base64)
+                repo.attach(item.sessionId, a.name, kind, a.mime, a.base64)
             }
             result.onSuccess { uploadedIds.add(a.id) }
-                .onFailure { e -> errors.add("${a.name}: ${e.friendly()}") }
+                .onFailure { e ->
+                    if (e is CancellationException) throw e
+                    errors.add("${a.name}: ${e.friendly()}")
+                }
         }
-        // Flag what landed; nothing leaves the staging list here. Evicting the
-        // successful uploads on a partial failure is what broke the retry: the
-        // re-send then referenced files it no longer carried. The task is only
-        // complete when the prompt itself is accepted.
-        _state.update { s ->
-            s.copy(
-                uploading = false,
-                pending = s.pending.map { att ->
-                    if (att.id in uploadedIds) att.copy(uploaded = true) else att
-                },
-            )
+        // Keep the whole captured batch until the prompt is accepted. A retry
+        // uploads only the files that did not land in earlier attempts.
+        if (sendBuffer[key] === item) {
+            sendBuffer[key] = item.copy(attachments = pending.map { att ->
+                if (att.id in uploadedIds) att.copy(uploaded = true) else att
+            })
+            _state.update { it.copy(uploading = false) }
         }
         return errors
     }

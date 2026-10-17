@@ -38,6 +38,10 @@ data class ChatMessage(
      * to look identical to a delivered one.
      */
     val delivered: Boolean = true,
+    /** A local send attempt is in progress; an undelivered idle row can be retried. */
+    val sending: Boolean = false,
+    /** The socket died after submission, so the server may already have accepted it. */
+    val deliveryUnknown: Boolean = false,
 ) {
     enum class Role { User, Assistant, System }
 

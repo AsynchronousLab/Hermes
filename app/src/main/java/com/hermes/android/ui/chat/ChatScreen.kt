@@ -54,6 +54,7 @@ import java.util.Locale
 fun ChatScreen(
     state: ChatUiState,
     onSend: (String) -> Boolean,
+    onRetrySend: (Long) -> Unit,
     onPickModel: () -> Unit,
     onPickReasoning: () -> Unit,
     onForkFrom: (ChatMessage) -> Unit,
@@ -247,6 +248,11 @@ fun ChatScreen(
                                 MessageBubble(
                                     msg = msg,
                                     onSpeak = onSpeak,
+                                    onRetry = if (msg.role == ChatMessage.Role.User &&
+                                        !msg.delivered && !msg.sending &&
+                                        state.messages.none { it.sending } &&
+                                        state.connection == RpcConnectionState.Connected
+                                    ) ({ onRetrySend(msg.key) }) else null,
                                     onFork = if (msg.role == ChatMessage.Role.Assistant &&
                                         msg.text.isNotBlank() && !msg.streaming
                                     ) {
@@ -325,7 +331,7 @@ fun ChatScreen(
 
         Composer(
             value = input,
-            streaming = state.streaming,
+            streaming = state.streaming || state.messages.any { it.sending },
             uploading = state.uploading,
             sessionReady = !state.loading && state.sessionId != null,
             pending = state.pending,
@@ -615,6 +621,7 @@ private fun joinBlocks(x: String, y: String): String = when {
 private fun MessageBubble(
     msg: ChatMessage,
     onSpeak: (String) -> Unit,
+    onRetry: (() -> Unit)? = null,
     /** Non-null only on finished assistant replies: "continue from here". */
     onFork: (() -> Unit)? = null,
 ) {
@@ -718,11 +725,25 @@ private fun MessageBubble(
             // delivered one.
             if (isUser && !msg.delivered) {
                 Spacer(Modifier.height(6.dp))
-                Text(
-                    "未发送",
-                    fontSize = 11.sp,
-                    color = MaterialTheme.colorScheme.error,
-                )
+                if (msg.sending) {
+                    Text("发送中…", fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onPrimary)
+                } else {
+                    if (msg.deliveryUnknown) {
+                        Text("结果未知，重试前请检查历史消息", fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onPrimary)
+                    }
+                    TextButton(
+                        onClick = { onRetry?.invoke() },
+                        enabled = onRetry != null,
+                        colors = ButtonDefaults.textButtonColors(
+                            contentColor = MaterialTheme.colorScheme.onPrimary,
+                        ),
+                    ) {
+                        Text(if (msg.deliveryUnknown) "重试（可能重复）" else "未发送 · 点击重试",
+                            fontSize = 11.sp)
+                    }
+                }
             }
 
             if (!isUser && !msg.streaming && msg.text.isNotBlank()) {

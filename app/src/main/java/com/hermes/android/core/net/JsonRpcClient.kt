@@ -373,6 +373,18 @@ class JsonRpcClient(
         }
     }
 
+    /** Wake a suspended/stale transport immediately when its chat returns to the foreground. */
+    suspend fun reconnectNow(cfg: HermesConfig) {
+        mutex.withLock {
+            teardownLocked()
+            closedByUser = false
+            config = cfg
+            reconnectAttempt = 0
+            _state.value = RpcConnectionState.Reconnecting
+            scheduleReconnect(cfg, generation)
+        }
+    }
+
     /** Cancels the socket, any handshake in flight and the reconnect timer. */
     private fun teardownLocked() {
         reconnectJob?.cancel()
