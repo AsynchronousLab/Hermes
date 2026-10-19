@@ -474,8 +474,9 @@ private fun ChatTopBar(
 
 @Composable
 private fun ConnectionBanner(state: RpcConnectionState) {
-    if (state == RpcConnectionState.Connected || state == RpcConnectionState.Disconnected) return
+    if (state == RpcConnectionState.Connected) return
     val text = when (state) {
+        RpcConnectionState.Disconnected -> "连接已断开"
         RpcConnectionState.Connecting -> "正在连接后端…"
         RpcConnectionState.Reconnecting -> "连接断开，正在重连…"
         RpcConnectionState.Failed -> "连接失败，请检查设置中的后端地址"

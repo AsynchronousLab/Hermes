@@ -17,12 +17,13 @@ import org.junit.Test
 class RpcDeliveryTest {
     private class Socket(private val accepted: Boolean = true) : WebSocket {
         val sent = CompletableDeferred<Unit>()
+        var cancelled = false
         override fun request() = Request.Builder().url("http://localhost/").build()
         override fun queueSize() = 0L
         override fun send(text: String): Boolean { sent.complete(Unit); return accepted }
         override fun send(bytes: ByteString) = accepted
         override fun close(code: Int, reason: String?) = true
-        override fun cancel() = Unit
+        override fun cancel() { cancelled = true }
     }
 
     private suspend fun withClient(socket: Socket?, block: suspend (JsonRpcClient) -> Unit) {
@@ -81,10 +82,41 @@ class RpcDeliveryTest {
     }
 
     @Test fun refusedFrameIsStillDefinitivelyUnsent() = runBlocking {
-        withClient(Socket(accepted = false)) { rpc ->
+        val socket = Socket(accepted = false)
+        withClient(socket) { rpc ->
             val failure = runCatching { rpc.rpcRaw("groups.send") }.exceptionOrNull()!!
             assertTrue(failure is RpcFailure.Rpc)
             assertFalse(isUnknownOutcome(failure))
+            assertEquals(RpcConnectionState.Reconnecting, rpc.state.value)
+            assertTrue(socket.cancelled)
+        }
+    }
+
+    @Test fun silentHalfOpenSocketIsInvalidatedAfterProbeTimeout() = runBlocking {
+        val socket = Socket()
+        withClient(socket) { rpc ->
+            @Suppress("UNCHECKED_CAST")
+            val state = JsonRpcClient::class.java.getDeclaredField("_state")
+                .apply { isAccessible = true }.get(rpc) as kotlinx.coroutines.flow.MutableStateFlow<RpcConnectionState>
+            state.value = RpcConnectionState.Connected
+            assertFalse(rpc.probeAndRecover(timeoutMs = 100))
+            assertEquals(RpcConnectionState.Reconnecting, rpc.state.value)
+            assertFalse(rpc.isConnected)
+            assertTrue(socket.cancelled)
+        }
+    }
+
+    @Test fun orphanedReconnectingStateGetsANewRetryLoop() = runBlocking {
+        withClient(null) { rpc ->
+            val cfg = HermesConfig("http://127.0.0.1:1", "u", "p")
+            rpc.ensureReconnect(cfg)
+            val retryField = JsonRpcClient::class.java.getDeclaredField("reconnectJob")
+                .apply { isAccessible = true }
+            val first = retryField.get(rpc) as Job
+            assertTrue(first.isActive)
+            assertEquals(RpcConnectionState.Reconnecting, rpc.state.value)
+            rpc.ensureReconnect(cfg)
+            assertSame(first, retryField.get(rpc))
         }
     }
 }

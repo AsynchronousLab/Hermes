@@ -63,6 +63,7 @@ sealed class RpcFailure(message: String) : Exception(message) {
  */
 private class Handshake(val id: Long) {
     val socket = AtomicReference<WebSocket?>(null)
+    val startedAtNanos: Long = System.nanoTime()
 }
 
 /** One server-push frame: `{"method":"event","params":{...}}`. */
@@ -259,22 +260,16 @@ class JsonRpcClient(
                     _state.value = RpcConnectionState.Disconnected
                     return null
                 }
-                // 4401/4403 mean the cookie the socket was opened with is already
-                // dead; retrying with it can never succeed.
+                // 4401/4403 mean the cookie the socket was opened with is dead.
                 val authIssue = cmd.code == 4401 || cmd.code == 4403
-                _state.value =
-                    if (authIssue) RpcConnectionState.Failed else RpcConnectionState.Reconnecting
+                _state.value = RpcConnectionState.Reconnecting
                 val cfg = config
-                val reauth = reauthenticate
                 return {
-                    if (authIssue && reauth != null) reauth()
-                    // If no reconnect job is already running, start one. Deciding
-                    // this *inside* the critical section is what stops a close
-                    // that lands during the previous loop's success path from
-                    // being dropped — that loop saw the connection die only
-                    // after it had already decided it was finished.
+                    // Never wait for login in the connection-command consumer:
+                    // it must stay free to process the next socket's onOpen.
+                    // The loop refreshes the cookie before its first ticket.
                     if (cfg != null && reconnectJob?.isActive != true) {
-                        scheduleReconnect(cfg, cmd.myGen)
+                        scheduleReconnect(cfg, cmd.myGen, refreshLoginFirst = authIssue)
                     }
                 }
             }
@@ -385,6 +380,53 @@ class JsonRpcClient(
         }
     }
 
+    /** Restore a missing retry loop without restarting one that is already working. */
+    suspend fun ensureReconnect(cfg: HermesConfig) {
+        mutex.withLock {
+            if (isConnectedLocked() && config == cfg) return
+            if (reconnectJob?.isActive == true && config == cfg) return
+            val opening = handshake
+            if (config == cfg && opening != null &&
+                System.nanoTime() - opening.startedAtNanos < HANDSHAKE_TIMEOUT_NS
+            ) return
+            teardownLocked()
+            closedByUser = false
+            config = cfg
+            reconnectAttempt = 0
+            _state.value = RpcConnectionState.Reconnecting
+            scheduleReconnect(cfg, generation)
+        }
+    }
+
+    /** Check a half-open socket and recover only if it is still the same one. */
+    suspend fun probeAndRecover(timeoutMs: Long = 8_000): Boolean {
+        val checked = mutex.withLock { if (isConnectedLocked()) socket else null } ?: return false
+        return try {
+            rpcRaw("gateway.ping", timeoutMs = timeoutMs)
+            true
+        } catch (t: CancellationException) {
+            throw t
+        } catch (_: Throwable) {
+            markSocketUnusable(checked)
+            false
+        }
+    }
+
+    private suspend fun markSocketUnusable(checked: WebSocket) {
+        mutex.withLock {
+            if (socket !== checked) return
+            socket = null
+            checked.cancel()
+            failAllPending(RpcFailure.ConnectionClosed())
+            if (closedByUser) {
+                _state.value = RpcConnectionState.Disconnected
+            } else {
+                _state.value = RpcConnectionState.Reconnecting
+                config?.let { scheduleReconnect(it, generation) }
+            }
+        }
+    }
+
     /** Cancels the socket, any handshake in flight and the reconnect timer. */
     private fun teardownLocked() {
         reconnectJob?.cancel()
@@ -410,7 +452,7 @@ class JsonRpcClient(
      * microseconds. Callers that need the outcome poll [isConnected] via
      * [awaitHandshake] outside the lock.
      */
-    private fun startSocketLocked(cfg: HermesConfig, ticket: String, isReconnect: Boolean) {
+    private fun startSocketLocked(cfg: HermesConfig, ticket: String, isReconnect: Boolean): Handshake {
         _state.value = if (isReconnect) RpcConnectionState.Reconnecting else RpcConnectionState.Connecting
         val myGen = generation
         // Registered *before* newWebSocket: the listener may fire before it returns.
@@ -426,6 +468,7 @@ class JsonRpcClient(
             runCatching { ws.cancel() }
             if (handshake === mine) handshake = null
         }
+        return mine
     }
 
     /** Waits for the current handshake, outside any lock. */
@@ -477,13 +520,26 @@ class JsonRpcClient(
      * the loop stopped for good. This keeps retrying with backoff instead, and
      * exits only on success, an explicit disconnect, or a generation change.
      */
-    private fun scheduleReconnect(cfg: HermesConfig, myGen: Long) {
+    private fun scheduleReconnect(
+        cfg: HermesConfig,
+        myGen: Long,
+        refreshLoginFirst: Boolean = false,
+    ) {
         if (closedByUser) return
         if (reconnectJob?.isActive == true) return
         reconnectJob = scope.launch {
             // Captured so the loop can recognise itself and hand the slot over
             // without clobbering a newer loop that already took over.
             val self = coroutineContext[Job]
+            if (refreshLoginFirst && !closedByUser && myGen == generation) {
+                try {
+                    reauthenticate?.invoke()
+                } catch (t: CancellationException) {
+                    throw t
+                } catch (_: Throwable) {
+                    // A failed login still leaves the retry loop alive.
+                }
+            }
             var attempt = reconnectAttempt
             var ticketFailures = 0
             while (!closedByUser && myGen == generation) {
@@ -509,7 +565,13 @@ class JsonRpcClient(
                     // connection for the rest of the process lifetime.
                     if (++ticketFailures >= TICKET_FAILURES_BEFORE_REAUTH) {
                         ticketFailures = 0
-                        reauthenticate?.invoke()
+                        try {
+                            reauthenticate?.invoke()
+                        } catch (t: CancellationException) {
+                            throw t
+                        } catch (_: Throwable) {
+                            // Keep the loop alive and retry after backoff.
+                        }
                     }
                     continue
                 }
@@ -517,13 +579,12 @@ class JsonRpcClient(
 
                 val started = mutex.withLock {
                     if (closedByUser || myGen != generation || isConnected) {
-                        false
+                        null
                     } else {
                         startSocketLocked(cfg, ticket, isReconnect = true)
-                        true
                     }
                 }
-                if (!started) continue
+                if (started == null) continue
 
                 if (awaitHandshake(myGen)) {
                     // Two orderings have to both recover, and neither may rely
@@ -542,6 +603,14 @@ class JsonRpcClient(
                         continue
                     }
                     return@launch
+                }
+                // A stalled handshake has no close callback. Cancel it before
+                // opening another socket, or repeated retries leak sockets.
+                mutex.withLock {
+                    if (handshake === started) {
+                        handshake = null
+                        started.socket.get()?.cancel()
+                    }
                 }
                 // Ticket or handshake failed: loop again with a longer backoff.
             }
@@ -640,19 +709,22 @@ private fun handleFrame(text: String) {
             put("method", JsonPrimitive(method))
             put("params", params)
         }
+        var rejectedSocket: WebSocket? = null
         val reply = try {
             // Registration and send share the teardown lock: a close cannot
             // drain pending calls just before this one registers on a dead socket.
             mutex.withLock {
                 val ws = socket ?: throw RpcFailure.NotConnected(method)
                 pending[id] = deferred
-                if (!ws.send(payload.toString())) {
+                if (!runCatching { ws.send(payload.toString()) }.getOrDefault(false)) {
+                    rejectedSocket = ws
                     throw RpcFailure.Rpc(-1, "WebSocket 发送失败: $method")
                 }
             }
             withTimeoutOrNull(timeoutMs) { deferred.await() }
         } finally {
             pending.remove(id)
+            rejectedSocket?.let { markSocketUnusable(it) }
         }
         if (reply == null) throw RpcFailure.Timeout(method)
 
@@ -688,6 +760,7 @@ private fun handleFrame(text: String) {
     companion object {
         /** Consecutive failed ticket fetches before assuming the cookie died. */
         private const val TICKET_FAILURES_BEFORE_REAUTH = 3
+        private const val HANDSHAKE_TIMEOUT_NS = 15_000_000_000L
 
         private val scope = kotlinx.coroutines.CoroutineScope(
             kotlinx.coroutines.SupervisorJob() + Dispatchers.IO

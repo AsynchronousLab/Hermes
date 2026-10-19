@@ -16,8 +16,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
 import com.hermes.android.ui.chat.HermesSpeaker
 import com.hermes.android.ui.contacts.ContactsScreen
 import com.hermes.android.ui.contacts.ContactsViewModel
@@ -44,6 +44,7 @@ import com.hermes.android.ui.settings.SettingsScreen
 import com.hermes.android.ui.settings.SettingsViewModel
 import com.hermes.android.ui.tools.ToolsScreen
 import com.hermes.android.ui.tools.ToolsViewModel
+import kotlinx.coroutines.delay
 
 private object Routes {
     const val CHATS = "chats"
@@ -313,12 +314,17 @@ private fun ChatRoute(
 ) {
     val state by vm.state.collectAsState()
     val lifecycleOwner = LocalLifecycleOwner.current
-    DisposableEffect(lifecycleOwner, vm) {
-        val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) vm.onForeground()
+    LaunchedEffect(lifecycleOwner, vm) {
+        lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            // Runs immediately for an already-resumed destination, then after
+            // each wake. Keep checking while visible: a half-open WebSocket
+            // may never deliver onFailure after Android suspends the radio.
+            vm.onForeground(wake = true)
+            while (true) {
+                delay(20_000)
+                vm.onForeground()
+            }
         }
-        lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
     val context = androidx.compose.ui.platform.LocalContext.current
     var showModels by remember { mutableStateOf(false) }

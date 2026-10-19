@@ -198,24 +198,33 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
             .onSuccess { list -> _state.update { s -> s.copy(commands = list) } }
     }
 
-    /** A screen wake can leave a half-open socket looking Connected until its next ping. */
-    fun onForeground() {
+    /** Called on resume and periodically while this chat is visible. */
+    fun onForeground(wake: Boolean = false) {
         if (foregroundJob?.isActive == true) return
         foregroundJob = viewModelScope.launch {
-            val cfg = settings.config.first()
-            if (!cfg.isComplete) return@launch
-            if (!repo.config.isComplete) repo.updateConfig(cfg)
-            if (repo.isConnected) {
-                val alive = runCatching {
-                    repo.rpc.rpcRaw("gateway.ping", timeoutMs = 4_000)
-                }.isSuccess
-                if (alive) return@launch
-                repo.rpc.reconnectNow(repo.config)
-            } else if (repo.connection.value == RpcConnectionState.Reconnecting ||
-                repo.connection.value == RpcConnectionState.Connecting) {
-                repo.rpc.reconnectNow(repo.config)
-            } else {
-                repo.connect().onFailure { repo.rpc.reconnectNow(repo.config) }
+            try {
+                val cfg = settings.config.first()
+                if (!cfg.isComplete) return@launch
+                if (!repo.config.isComplete) repo.updateConfig(cfg)
+                if (repo.isConnected) {
+                    // A stale socket can keep the Connected flag indefinitely.
+                    // The probe invalidates only the socket it checked, so a
+                    // late timeout cannot close a replacement connection.
+                    repo.rpc.probeAndRecover(timeoutMs = 8_000)
+                } else if (wake && repo.connection.value == RpcConnectionState.Reconnecting) {
+                    // A backoff timer from the sleeping period may be at 30s.
+                    // Resume starts one fresh attempt immediately.
+                    repo.rpc.reconnectNow(repo.config)
+                } else if (repo.connection.value == RpcConnectionState.Reconnecting ||
+                    repo.connection.value == RpcConnectionState.Connecting) {
+                    repo.rpc.ensureReconnect(repo.config)
+                } else {
+                    repo.connect().onFailure { repo.rpc.ensureReconnect(repo.config) }
+                }
+            } catch (t: CancellationException) {
+                throw t
+            } catch (_: Throwable) {
+                // The visible-screen watchdog will try again on its next tick.
             }
         }
     }

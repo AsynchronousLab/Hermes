@@ -179,8 +179,9 @@ class HermesRepository {
     private suspend fun loginFresh(): Boolean {
         val cfg = config
         if (!cfg.isComplete) return false
-        jar.clear()
-        return performLogin(cfg, force = false) is LoginOutcome.Ok
+        // Force inside authMutex. Clearing before acquiring it allowed a second
+        // re-login to erase the cookie the first one had just committed.
+        return performLogin(cfg, force = true) is LoginOutcome.Ok
     }
 
     // ---------------------------------------------------------------- auth ---
