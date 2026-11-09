@@ -236,8 +236,22 @@ fun HermesAppRoot(
             }
 
             composable(Routes.APP_SETTINGS) {
-                AppSettingsScreen(appearance, onTheme, onFontScale,
-                    onBack = { navController.popBackStack() })
+                // Read the saved connection state directly:这页不建 SettingsViewModel，
+                // 否则打开设置会顺带触发一次 profile 拉取。
+                val cfg by app.settings.config.collectAsState(
+                    initial = com.hermes.android.core.net.HermesConfig()
+                )
+                AppSettingsScreen(
+                    appearance = appearance,
+                    onTheme = onTheme,
+                    onFontScale = onFontScale,
+                    backendUrl = cfg.normalizedBaseUrl,
+                    proxyLabel = com.hermes.android.ui.settings.proxyLabel(cfg.proxy),
+                    onOpenBackend = {
+                        navController.navigate(Routes.BACKEND) { launchSingleTop = true }
+                    },
+                    onBack = { navController.popBackStack() },
+                )
             }
 
             composable(Routes.CHAT) {

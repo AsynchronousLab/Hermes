@@ -79,6 +79,12 @@ fun SettingsScreen(
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                    // 代理在页面下方，滚动不到的人会以为没有这项功能。
+                    Text(
+                        "当前：${state.baseUrl.ifBlank { "未配置" }} · 代理 ${proxyLabel(state.config.proxy)}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
             }
 
