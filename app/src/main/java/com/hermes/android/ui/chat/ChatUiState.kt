@@ -82,8 +82,12 @@ data class PendingAttachment(
 )
 
 data class ChatUiState(
+    /** Runtime id used by session-scoped RPCs; dies when the gateway reaps the session. */
     val sessionId: String? = null,
+    /** Durable id `session.resume` needs to bring the conversation back. */
     val storedSessionId: String? = null,
+    /** Set when this conversation is a branch: the session it was forked from. */
+    val parentSessionId: String? = null,
     val title: String = "新会话",
     val messages: List<ChatMessage> = emptyList(),
     val streaming: Boolean = false,
@@ -95,6 +99,8 @@ data class ChatUiState(
         com.hermes.android.core.model.ReasoningLevel.MEDIUM,
     val usage: com.hermes.android.core.model.Usage? = null,
     val models: List<com.hermes.android.core.model.ModelProvider> = emptyList(),
+    val modelsLoading: Boolean = false,
+    val modelsError: String? = null,
     val commands: List<com.hermes.android.core.CommandEntry> = emptyList(),
     val notice: String? = null,
     val error: String? = null,

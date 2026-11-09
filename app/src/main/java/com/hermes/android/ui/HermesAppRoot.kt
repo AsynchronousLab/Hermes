@@ -286,6 +286,9 @@ private fun ChatRoute(
             providers = state.models,
             current = state.model,
             currentProvider = state.provider,
+            loading = state.modelsLoading,
+            error = state.modelsError,
+            onReload = { vm.refreshModels() },
             onPick = { p, m ->
                 vm.selectModel(p, m)
                 showModels = false
@@ -320,5 +323,10 @@ private fun ChatRoute(
         onRequestResponse = vm::respondToRequest,
         onReadError = vm::showError,
         onConsumeRestoredDraft = vm::consumeRestoreDraft,
+        onOpenParent = { parent ->
+            // A branch remembers its parent: opening it is a resume of the
+            // durable id, the same route the list uses.
+            navController.navigate(Routes.chat("resume:$parent"))
+        },
     )
 }

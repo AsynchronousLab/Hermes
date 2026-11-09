@@ -6,11 +6,9 @@ import androidx.lifecycle.viewModelScope
 import com.hermes.android.core.HermesRepository
 import com.hermes.android.core.model.SessionSummary
 import com.hermes.android.core.net.RpcConnectionState
-import com.hermes.android.core.net.RpcFailure
 import com.hermes.android.core.store.SettingsStore
 import com.hermes.android.ui.chat.friendly
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -32,10 +30,29 @@ data class SessionListUiState(
     val deleting: Set<String> = emptySet(),
     val notice: String? = null,
 ) {
-    /** Chats and rooms interleaved by recency — the IM-style single list. */
+    /**
+     * Chats and rooms interleaved — the IM-style single list.
+     *
+     * Chats keep the order `session.list` returned: the gateway sorts by **last
+     * active**, which is the order an IM list wants. Re-sorting here by
+     * `started_at` (what the row carries) put a conversation you answered a
+     * minute ago back down at the position where it was created, so every
+     * refresh looked like it scrambled the list. Rooms are slotted in by their
+     * own activity stamp instead of being dumped at one end.
+     */
     val conversations: List<Conversation>
-        get() = (sessions.map { Conversation.Chat(it) } + rooms.map { Conversation.Room(it) })
-            .sortedByDescending { it.stamp ?: 0.0 }
+        get() {
+            val out = sessions.mapTo(mutableListOf()) { Conversation.Chat(it) as Conversation }
+            val rooms = rooms
+                .map { Conversation.Room(it) as Conversation }
+                .sortedByDescending { it.stamp ?: 0.0 }
+            for (room in rooms) {
+                val stamp = room.stamp ?: 0.0
+                val after = out.indexOfLast { (it.stamp ?: 0.0) >= stamp }
+                out.add(if (after < 0) 0 else after + 1, room)
+            }
+            return out
+        }
 
     val visible: List<Conversation>
         get() {
@@ -90,6 +107,12 @@ class SessionListViewModel(
     private var watchJob: Job? = null
     private var lastSessionId: String? = null
 
+    /** One list fetch at a time; a burst of triggers collapses into one rerun. */
+    private val refreshLock = kotlinx.coroutines.sync.Mutex()
+
+    /** Auto triggers (reconnect, `sessions.changed`) are gated by this gap. */
+    private var lastAutoRefreshAt = 0L
+
     init {
         observeConnection()
         observeSessionChanges()
@@ -109,7 +132,7 @@ class SessionListViewModel(
     private fun observeConnection() = viewModelScope.launch {
         repo.connection.collect { c ->
             _state.update { it.copy(connection = c) }
-            if (c == RpcConnectionState.Connected) refresh()
+            if (c == RpcConnectionState.Connected) autoRefresh()
         }
     }
 
@@ -118,12 +141,26 @@ class SessionListViewModel(
         watchJob?.cancel()
         watchJob = viewModelScope.launch {
             repo.events.collect { ev ->
-                if (ev.type == "sessions.changed") refresh(silent = true)
+                if (ev.type == "sessions.changed") autoRefresh()
             }
         }
     }
 
-    fun refresh(silent: Boolean = false) = viewModelScope.launch {
+    /**
+     * Refresh driven by the server rather than by the user.
+     *
+     * Never shows the refresh affordance and never runs more than once per
+     * [AUTO_REFRESH_GAP_MS]: returning to the list used to trigger a visible
+     * reload on every socket flap, which read as "每次返回都强制刷新一遍".
+     */
+    private fun autoRefresh() {
+        val now = System.currentTimeMillis()
+        if (now - lastAutoRefreshAt < AUTO_REFRESH_GAP_MS) return
+        lastAutoRefreshAt = now
+        refresh(silent = true, rooms = false)
+    }
+
+    fun refresh(silent: Boolean = false, rooms: Boolean = true) = viewModelScope.launch {
         // Without a backend there is nothing to list; stop the spinner and say so
         // instead of spinning forever.
         if (!repo.config.isComplete) {
@@ -137,11 +174,35 @@ class SessionListViewModel(
             }
             return@launch
         }
+        // Coalesce instead of stacking: two overlapping fetches raced each other
+        // and the slower one repainted an older list. A tap that lands while a
+        // fetch is running is remembered, not dropped.
+        if (!refreshLock.tryLock()) {
+            if (!silent) rerunRequested = true
+            return@launch
+        }
+        try {
+            fetch(silent = silent, rooms = rooms)
+            while (rerunRequested) {
+                rerunRequested = false
+                fetch(silent = true, rooms = false)
+            }
+        } finally {
+            refreshLock.unlock()
+        }
+    }
+
+    /** Set when a user refresh arrived while one was already running. */
+    private var rerunRequested = false
+
+    private suspend fun fetch(silent: Boolean, rooms: Boolean) {
         _state.update { it.copy(refreshing = !silent && !it.loading, error = null, needsSetup = false) }
         // Rooms join the same list. A gateway without group support answers
         // `groups.list` with an error, which must not take the whole list down.
-        runCatching { repo.listAllGroups() }.onSuccess { rooms ->
-            _state.update { it.copy(rooms = rooms) }
+        if (rooms) {
+            runCatching { repo.listAllGroups() }.onSuccess { list ->
+                _state.update { it.copy(rooms = list) }
+            }
         }
         runCatching { repo.listSessions() }.fold(
             onSuccess = { list ->
@@ -173,37 +234,28 @@ class SessionListViewModel(
     fun newSession(onCreated: (String) -> Unit) = viewModelScope.launch {
         runCatching { repo.createSession() }.fold(
             onSuccess = { c ->
-                settings.rememberSession(c.sessionId, c.storedSessionId)
+                settings.rememberSession(c.sessionId, c.durableId)
                 lastSessionId = c.sessionId
-                onCreated(c.sessionId)
-                refresh(silent = true)
+                // Open by durable id whenever the gateway gave us one: the chat
+                // screen then has exactly one resume path, and a socket drop
+                // between create and open cannot orphan the session.
+                onCreated(c.durableId?.let { "resume:$it" } ?: c.sessionId)
+                refresh(silent = true, rooms = false)
             },
             onFailure = { t -> _state.update { it.copy(error = t.friendly()) } },
         )
     }
 
-    /** Open a stored session: the gateway wants the durable id for `session.resume`. */
+    /**
+     * Opens a stored session.
+     *
+     * Navigation only — the chat screen performs the one and only
+     * `session.resume`. Probing here first registered a second live session on
+     * every tap, and when that probe's runtime id was orphan-reaped the user saw
+     * "该会话无法恢复：session not found" for a conversation that was intact.
+     */
     fun open(s: SessionSummary, navigate: (String) -> Unit) {
-        viewModelScope.launch {
-            runCatching { repo.resumeSession(s.id) }.fold(
-                onSuccess = { c ->
-                    settings.rememberSession(c.sessionId, c.storedSessionId)
-                    navigate("resume:${s.id}")
-                },
-                onFailure = { t ->
-                    // Stay on the list instead of navigating. The chat screen
-                    // opens `resume:<id>` by issuing the very same
-                    // `session.resume`, so navigating here only replayed the
-                    // failure and surfaced the error in two places at once.
-                    // Leaving the user here lets them retry or pick another
-                    // session with the reason visible.
-                    val detail = (t as? RpcFailure.Rpc)?.message?.take(60)
-                    _state.update {
-                        it.copy(error = "该会话无法恢复" + (detail?.let { d -> "：$d" } ?: ""))
-                    }
-                },
-            )
-        }
+        navigate("resume:${s.durableId}")
     }
 
     fun rememberNew(sessionId: String) { lastSessionId = sessionId }
@@ -217,7 +269,7 @@ class SessionListViewModel(
     fun delete(s: SessionSummary) = viewModelScope.launch {
         if (s.id in _state.value.deleting) return@launch
         _state.update { it.copy(deleting = it.deleting + s.id, error = null) }
-        runCatching { repo.deleteSession(s.id) }.fold(
+        runCatching { repo.deleteSession(s.durableId) }.fold(
             onSuccess = {
                 // If this was the session the app resumes on launch, drop the
                 // pointer too — otherwise the next start tries to resume a
@@ -259,3 +311,12 @@ class SessionListViewModel(
             SessionListViewModel(repo, settings) as T
     }
 }
+
+/**
+ * Minimum gap between server-driven list refreshes.
+ *
+ * Long enough that a reconnect burst plus the `sessions.changed` frames it
+ * triggers collapse into one fetch, short enough that a new session still shows
+ * up promptly.
+ */
+private const val AUTO_REFRESH_GAP_MS = 2_500L
