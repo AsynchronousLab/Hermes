@@ -1,6 +1,7 @@
 package com.hermes.android
 
 import android.app.Application
+import com.hermes.android.core.CrashLog
 import com.hermes.android.core.HermesRepository
 import com.hermes.android.core.store.SettingsStore
 
@@ -14,4 +15,10 @@ class HermesApp : Application() {
 
     val repository: HermesRepository by lazy { HermesRepository() }
     val settings: SettingsStore by lazy { SettingsStore(this) }
+
+    override fun onCreate() {
+        super.onCreate()
+        // Debug channel: keep the last crash so the next launch can show it.
+        CrashLog.install(this)
+    }
 }

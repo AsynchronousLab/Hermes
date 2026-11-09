@@ -12,7 +12,13 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Density
 import com.hermes.android.core.store.AppAppearance
 import kotlinx.coroutines.launch
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import com.hermes.android.core.CrashLog
+import com.hermes.android.ui.CrashReportScreen
 import com.hermes.android.ui.HermesAppRoot
 import com.hermes.android.ui.theme.HermesTheme
 
