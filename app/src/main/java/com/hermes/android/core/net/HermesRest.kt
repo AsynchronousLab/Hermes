@@ -37,7 +37,7 @@ class HermesRest(
                 .build()
             client.newCall(req).execute().use { r ->
                 val body = r.body?.string().orEmpty()
-                if (!r.isSuccessful) throw RestException(r.code, path, body)
+                if (!r.isSuccessful) throw RestException(r.code, path, body, target)
                 body
             }
         }
@@ -46,7 +46,7 @@ class HermesRest(
         withContext(Dispatchers.IO) {
             val body = getText(path, query)
             HermesHttp.json.parseToJsonElement(body) as? JsonObject
-                ?: throw RestException(0, path, "响应不是 JSON 对象")
+                ?: throw RestException(0, path, "响应不是 JSON 对象", url(path, query))
         }
 
     suspend fun postJson(path: String, body: JsonObject): String = withContext(Dispatchers.IO) {
@@ -58,14 +58,14 @@ class HermesRest(
             .build()
         client.newCall(req).execute().use { r ->
             val text = r.body?.string().orEmpty()
-            if (!r.isSuccessful) throw RestException(r.code, path, text)
+            if (!r.isSuccessful) throw RestException(r.code, path, text, target)
             text
         }
     }
 
     suspend fun postJsonObject(path: String, body: JsonObject): JsonObject =
         HermesHttp.json.parseToJsonElement(postJson(path, body)) as? JsonObject
-            ?: throw RestException(0, path, "响应不是 JSON 对象")
+            ?: throw RestException(0, path, "响应不是 JSON 对象", url(path))
 
     suspend fun postForm(path: String, form: Map<String, String>): String = withContext(Dispatchers.IO) {
         val target = url(path)
@@ -77,7 +77,7 @@ class HermesRest(
             .build()
         client.newCall(req).execute().use { r ->
             val text = r.body?.string().orEmpty()
-            if (!r.isSuccessful) throw RestException(r.code, path, text)
+            if (!r.isSuccessful) throw RestException(r.code, path, text, target)
             text
         }
     }
@@ -87,7 +87,7 @@ class HermesRest(
         withContext(Dispatchers.IO) {
             val req = Request.Builder().url(url(path, query)).get().build()
             client.newCall(req).execute().use { r ->
-                if (!r.isSuccessful) throw RestException(r.code, path, "")
+                if (!r.isSuccessful) throw RestException(r.code, path, "", req.url.toString())
                 r.body?.bytes() ?: ByteArray(0)
             }
         }
@@ -95,11 +95,24 @@ class HermesRest(
     private fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
 }
 
-class RestException(val code: Int, val path: String, val body: String) : Exception(
+/**
+ * A REST call failed.
+ *
+ * [url] is the address the request actually reached. Without it "接口不存在"
+ * was unattributable: a 404 from a *different port* (the OpenAI-compatible
+ * layer answers 404 for every `/api/...`) read exactly like a missing endpoint on
+ * the right one.
+ */
+class RestException(
+    val code: Int,
+    val path: String,
+    val body: String,
+    val url: String = "",
+) : Exception(
     when (code) {
-        401 -> "认证已失效，请重新登录 (HTTP 401)"
-        403 -> "没有权限 (HTTP 403)"
-        404 -> "接口不存在: $path"
-        else -> "请求失败 HTTP $code: ${body.take(160)}"
+        401 -> "认证已失效，请重新登录 (HTTP 401): ${url.ifBlank { path }}"
+        403 -> "没有权限 (HTTP 403): ${url.ifBlank { path }}"
+        404 -> "接口不存在 (HTTP 404): ${url.ifBlank { path }}"
+        else -> "请求失败 HTTP $code: ${url.ifBlank { path }} ${body.take(120)}"
     }
 )

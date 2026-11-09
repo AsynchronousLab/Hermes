@@ -87,7 +87,17 @@ fun SettingsScreen(
                 onValueChange = onBaseUrl,
                 label = { Text("后端地址") },
                 placeholder = { Text("http://192.168.1.10:9119") },
-                supportingText = { Text("例如 http://192.168.1.10:9119，使用正斜杠 /，支持 http:// 或 https://") },
+                supportingText = {
+                    val suffix = baseUrlPathSuffix(state.baseUrl)
+                    if (suffix != null) {
+                        Text(
+                            "地址带了路径 /$suffix：Hermes 接口在根路径下，填到端口即可",
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    } else {
+                        Text("例如 http://192.168.1.10:9119，使用正斜杠 /，支持 http:// 或 https://")
+                    }
+                },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
@@ -325,4 +335,18 @@ private fun ConnectionCard(state: SettingsUiState) {
             }
         }
     }
+}
+
+/**
+ * The path part of a typed base URL, or null when it has none.
+ *
+ * Hermes serves its API at the root, so `http://host:9119/hermes` silently
+ * 404s every call while looking like a perfectly good address.
+ */
+internal fun baseUrlPathSuffix(raw: String): String? {
+    val value = raw.trim()
+    if (value.isEmpty()) return null
+    val withoutScheme = value.substringAfter("://", value)
+    val path = withoutScheme.substringAfter('/', "")
+    return path.trim('/').takeIf { it.isNotBlank() }
 }

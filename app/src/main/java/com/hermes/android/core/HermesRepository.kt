@@ -7,6 +7,7 @@ import com.hermes.android.core.net.HermesHttp
 import com.hermes.android.core.net.HermesProxySelector
 import com.hermes.android.core.net.HermesRest
 import com.hermes.android.core.net.JsonRpcClient
+import com.hermes.android.core.net.RestException
 import com.hermes.android.core.net.RpcFailure
 import com.hermes.android.core.net.SessionCookieJar
 import kotlinx.coroutines.flow.SharedFlow
@@ -201,6 +202,26 @@ class HermesRepository {
         )
     }
 
+    /**
+     * Explains a failed `/api/health` probe.
+     *
+     * A 404 here is the most confusing failure there is: the host is reachable,
+     * something is listening, and the client still says "接口不存在". The
+     * OpenAI-compatible surface (default 8787) answers 200 on `/` and 404 on
+     * every `/api/...`, and an address with a path suffix (`/hermes`) 404s the
+     * same way — so name both possibilities instead of echoing the status code.
+     */
+    private fun describeHealthFailure(t: Throwable, base: String): String {
+        val rest = t as? RestException
+        if (rest?.code != 404) return HermesAuth.describeNetworkError(t)
+        return buildString {
+            append("地址可以访问，但这个端口没有 Hermes 控制台接口")
+            append("（").append(base).append("/api/health → 404）。\n")
+            append("· Hermes 控制台默认端口是 9119；8787 是 OpenAI 兼容层，不提供 /api 接口。\n")
+            append("· 地址只填到端口，不要带路径后缀（例如 /hermes）。")
+        }
+    }
+
     /** Logs in if needed, then opens the WebSocket. Returns the failure if any. */
     suspend fun connect(force: Boolean = false): Result<Unit> {
         val cfg = config
@@ -246,8 +267,8 @@ class HermesRepository {
         if (!config.isComplete) return ConnectionTestResult.Failed("请填写后端地址、用户名和密码")
         val started = System.currentTimeMillis()
 
-        val health = health().getOrElse {
-            return ConnectionTestResult.Failed(HermesAuth.describeNetworkError(it))
+        val health = health().getOrElse { t ->
+            return ConnectionTestResult.Failed(describeHealthFailure(t, config.normalizedBaseUrl))
         }
         val httpMs = System.currentTimeMillis() - started
 
