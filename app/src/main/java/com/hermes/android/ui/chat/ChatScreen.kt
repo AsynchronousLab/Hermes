@@ -8,7 +8,9 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -18,6 +20,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.FormatListBulleted
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -28,6 +31,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
@@ -69,10 +73,33 @@ fun ChatScreen(
     onRequestResponse: (ServerRequest, String) -> Unit,
     onReadError: (String) -> Unit,
     onConsumeRestoredDraft: () -> Unit,
+    /** Opens the session this one was branched from, when it has a parent. */
+    onOpenParent: (String) -> Unit = {},
 ) {
     val listState = rememberLazyListState()
     var input by rememberSaveable { mutableStateOf("") }
     val context = LocalContext.current
+
+    // ── 会话内跳转 ─────────────────────────────────────────────────────
+    // 一个可滚动的锚点：长对话里按「上一条我的消息」翻页已经不够用，
+    // 所以补上面板（提问大纲 / 全文查找）和跳转后的高亮。
+    var showJumpSheet by remember { mutableStateOf(false) }
+    var highlightKey by remember { mutableStateOf<Long?>(null) }
+    val scope0 = rememberCoroutineScope()
+
+    /** Scrolls to a transcript index and flashes that bubble. */
+    fun jumpTo(target: JumpTarget) {
+        scope0.launch {
+            listState.animateScrollToItem(target.index)
+            highlightKey = target.key
+            kotlinx.coroutines.delay(1_400)
+            if (highlightKey == target.key) highlightKey = null
+        }
+    }
+
+    // 引用：长按气泡取一段原文，发送时作为 Markdown 引用块带入，
+    // 这样引用在服务端的记录里也是可读的，而不是只存在于本机 UI。
+    var quoted by remember { mutableStateOf<String?>(null) }
 
     // A failed send (upload or submit) hands the text back: retry is one tap
     // instead of a retype.
@@ -194,6 +221,8 @@ fun ChatScreen(
             onPickReasoning = onPickReasoning,
             onNewSession = onNewSession,
             onSpeakToggle = onSpeakToggle,
+            onOpenJump = { showJumpSheet = true },
+            onOpenParent = onOpenParent,
         )
 
         ConnectionBanner(state.connection)
@@ -246,12 +275,14 @@ fun ChatScreen(
                             items(transcript, key = { it.key }) { msg ->
                                 MessageBubble(
                                     msg = msg,
+                                    highlighted = msg.key == highlightKey,
                                     onSpeak = onSpeak,
                                     onRetry = if (msg.role == ChatMessage.Role.User &&
                                         !msg.delivered && !msg.sending &&
                                         state.messages.none { it.sending } &&
                                         state.connection == RpcConnectionState.Connected
                                     ) ({ onRetrySend(msg.key) }) else null,
+                                    onQuote = { quoted = it },
                                     onFork = if (msg.role == ChatMessage.Role.Assistant &&
                                         msg.text.isNotBlank() && !msg.streaming
                                     ) {
@@ -271,11 +302,18 @@ fun ChatScreen(
                         Column(
                             Modifier.align(Alignment.CenterEnd).padding(end = 6.dp),
                             verticalArrangement = Arrangement.spacedBy(8.dp),
+                            horizontalAlignment = Alignment.End,
                         ) {
+                            // 提问大纲 / 全文查找：长对话里真正的「跳转」入口。
+                            ScrollJumpButton(
+                                icon = Icons.AutoMirrored.Filled.FormatListBulleted,
+                                contentDescription = "跳转到对话中的某处",
+                                onClick = { showJumpSheet = true },
+                            )
                             if (!atTop) {
                                 ScrollJumpButton(
                                     icon = Icons.Default.KeyboardArrowUp,
-                                    contentDescription = "上一条我的消息",
+                                    contentDescription = "上一条我的消息（双击回到开头）",
                                     onClick = {
                                         val now = System.currentTimeMillis()
                                         val target = if (now - lastUpTap < DOUBLE_TAP_MS) {
@@ -294,7 +332,7 @@ fun ChatScreen(
                             if (!atBottom) {
                                 ScrollJumpButton(
                                     icon = Icons.Default.KeyboardArrowDown,
-                                    contentDescription = "下一条我的消息",
+                                    contentDescription = "下一条我的消息（双击回到结尾）",
                                     onClick = {
                                         val now = System.currentTimeMillis()
                                         val last = listState.layoutInfo.totalItemsCount - 1
@@ -341,12 +379,19 @@ fun ChatScreen(
             uploading = state.uploading,
             sessionReady = !state.loading && state.sessionId != null,
             pending = state.pending,
+            quoted = quoted,
+            onClearQuote = { quoted = null },
             onValueChange = { input = it },
             onSend = {
                 // Only clear the draft once the ViewModel accepted it, so a
                 // not-yet-ready session does not silently swallow the message.
-                val draft = input
-                if (onSend(draft)) input = ""
+                // A quote rides in as a Markdown blockquote so it survives in
+                // the server-side transcript instead of only on this screen.
+                val draft = composeWithQuote(quoted, input)
+                if (onSend(draft)) {
+                    input = ""
+                    quoted = null
+                }
             },
             onAttach = { filePicker.launch(arrayOf("*/*")) },
             onRemoveAttachment = onRemoveAttachment,
@@ -388,6 +433,40 @@ fun ChatScreen(
             },
         )
     }
+
+    if (showJumpSheet) {
+        ChatJumpSheet(
+            rows = transcript,
+            onJump = { jumpTo(it) },
+            onJumpLatest = { scope0.launch { listState.animateScrollToEnd() } },
+            onDismiss = { showJumpSheet = false },
+        )
+    }
+}
+
+/**
+ * First few lines of a bubble, bounded so a quote cannot swallow the composer.
+ *
+ * The cap is on both dimensions because a single 4000-character line (tool
+ * output, minified JSON) would otherwise pass a line-only limit untouched.
+ */
+internal fun quoteExcerpt(text: String, maxLines: Int = 6, maxChars: Int = 240): String {
+    val body = text.trim().lines().take(maxLines).joinToString("\n").trim()
+    return if (body.length <= maxChars) body else body.take(maxChars).trimEnd() + "…"
+}
+
+/**
+ * Prefixes the draft with a Markdown blockquote of [quoted].
+ *
+ * Every line is quoted so a multi-line snippet cannot pass for the author's own
+ * words — the gateway stores exactly what it is sent, and a half-quoted block
+ * would show up later as plain text.
+ */
+internal fun composeWithQuote(quoted: String?, draft: String): String {
+    val body = quoted?.trim().orEmpty()
+    if (body.isEmpty()) return draft
+    val block = body.lines().joinToString("\n") { "> $it" }
+    return if (draft.isBlank()) "$block\n\n" else "$block\n\n$draft"
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -398,6 +477,8 @@ private fun ChatTopBar(
     onPickReasoning: () -> Unit,
     onNewSession: () -> Unit,
     onSpeakToggle: (Boolean) -> Unit,
+    onOpenJump: () -> Unit,
+    onOpenParent: (String) -> Unit,
 ) {
     var menu by remember { mutableStateOf(false) }
     Column(Modifier.background(MaterialTheme.colorScheme.surface)) {
@@ -453,6 +534,16 @@ private fun ChatTopBar(
                     DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                         // 分叉已移到每条 AI 回复上的「从此处继续」，
                         // 这里只保留会话级操作。
+                        DropdownMenuItem(
+                            text = { Text("跳转到…") },
+                            onClick = { menu = false; onOpenJump() },
+                        )
+                        state.parentSessionId?.takeIf { it.isNotBlank() }?.let { parent ->
+                            DropdownMenuItem(
+                                text = { Text("打开原会话") },
+                                onClick = { menu = false; onOpenParent(parent) },
+                            )
+                        }
                         DropdownMenuItem(
                             text = { Text("新建会话") },
                             onClick = { menu = false; onNewSession() },
@@ -627,13 +718,19 @@ private fun joinBlocks(x: String, y: String): String = when {
 @Composable
 private fun MessageBubble(
     msg: ChatMessage,
+    /** Flashes the bubble after a jump so the reader can see where they landed. */
+    highlighted: Boolean = false,
     onSpeak: (String) -> Unit,
     onRetry: (() -> Unit)? = null,
+    /** Takes an excerpt of this bubble into the composer as a quote. */
+    onQuote: ((String) -> Unit)? = null,
     /** Non-null only on finished assistant replies: "continue from here". */
     onFork: (() -> Unit)? = null,
 ) {
     val isUser = msg.role == ChatMessage.Role.User
     val clipboard = LocalClipboardManager.current
+    var menu by remember(msg.key) { mutableStateOf(false) }
+    val haptic = androidx.compose.ui.platform.LocalHapticFeedback.current
 
     // Anything that would render *below* the execution strip. Gates the
     // divider so a strip-only bubble (thinking arrived, body did not) does not
@@ -652,6 +749,12 @@ private fun MessageBubble(
         return
     }
 
+    val bubbleShape = RoundedCornerShape(
+        topStart = 14.dp, topEnd = 14.dp,
+        bottomStart = if (isUser) 14.dp else 4.dp,
+        bottomEnd = if (isUser) 4.dp else 14.dp,
+    )
+
     Row(Modifier.fillMaxWidth(), horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start) {
         if (!isUser) {
             Avatar()
@@ -660,17 +763,31 @@ private fun MessageBubble(
         Column(
             Modifier
                 .widthIn(max = 320.dp)
-                .clip(
-                    RoundedCornerShape(
-                        topStart = 14.dp, topEnd = 14.dp,
-                        bottomStart = if (isUser) 14.dp else 4.dp,
-                        bottomEnd = if (isUser) 4.dp else 14.dp,
-                    )
-                )
+                .clip(bubbleShape)
                 .background(
                     if (isUser) MaterialTheme.colorScheme.primary
                     else MaterialTheme.colorScheme.surfaceVariant
                 )
+                .then(
+                    if (highlighted) {
+                        Modifier.border(1.5.dp, MaterialTheme.colorScheme.tertiary, bubbleShape)
+                    } else {
+                        Modifier
+                    }
+                )
+                // Long-press opens the per-message actions. `pointerInput` rather
+                // than `combinedClickable` so the bubble keeps no ripple and does
+                // not intercept taps meant for links inside the markdown.
+                .pointerInput(msg.key) {
+                    detectTapGestures(
+                        onLongPress = {
+                            haptic.performHapticFeedback(
+                                androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress
+                            )
+                            menu = true
+                        }
+                    )
+                }
                 .padding(horizontal = 12.dp, vertical = 9.dp),
         ) {
             // Reasoning and tool calls collapse into a single strip so the
@@ -782,6 +899,34 @@ private fun MessageBubble(
                             )
                         }
                     }
+                }
+            }
+
+            // 长按菜单：复制 / 引用 / 从此处继续。
+            DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                if (msg.text.isNotBlank()) {
+                    DropdownMenuItem(
+                        text = { Text("复制") },
+                        onClick = {
+                            menu = false
+                            clipboard.setText(AnnotatedString(msg.text))
+                        },
+                    )
+                    if (onQuote != null) {
+                        DropdownMenuItem(
+                            text = { Text("引用") },
+                            onClick = {
+                                menu = false
+                                onQuote(quoteExcerpt(msg.text))
+                            },
+                        )
+                    }
+                }
+                if (onFork != null) {
+                    DropdownMenuItem(
+                        text = { Text("从此处继续") },
+                        onClick = { menu = false; onFork() },
+                    )
                 }
             }
         }
@@ -1012,6 +1157,8 @@ private fun Composer(
     uploading: Boolean,
     sessionReady: Boolean,
     pending: List<PendingAttachment>,
+    quoted: String? = null,
+    onClearQuote: () -> Unit = {},
     onValueChange: (String) -> Unit,
     onSend: () -> Unit,
     onAttach: () -> Unit,
@@ -1027,6 +1174,35 @@ private fun Composer(
                 .navigationBarsPadding()
                 .padding(horizontal = 8.dp, vertical = 6.dp)
         ) {
+            // 引用预览：发送前能看到自己引用了什么，点 ✕ 取消。
+            quoted?.takeIf { it.isNotBlank() }?.let { q ->
+                Row(
+                    Modifier.fillMaxWidth()
+                        .padding(bottom = 6.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant)
+                        .clickable(onClick = onClearQuote)
+                        .padding(horizontal = 10.dp, vertical = 7.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            "引用",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                        Text(
+                            q.replace('\n', ' ').take(90),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    Spacer(Modifier.width(8.dp))
+                    Icon(Icons.Default.Close, "取消引用", Modifier.size(14.dp))
+                }
+            }
             if (pending.isNotEmpty()) {
                 Row(
                     Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(bottom = 6.dp),

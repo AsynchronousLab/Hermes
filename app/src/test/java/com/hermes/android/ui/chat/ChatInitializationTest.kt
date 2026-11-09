@@ -2,6 +2,7 @@ package com.hermes.android.ui.chat
 
 import androidx.lifecycle.ViewModelStore
 import com.hermes.android.core.HermesRepository
+import com.hermes.android.core.ModelOptionsSnapshot
 import com.hermes.android.core.model.SessionCreated
 import com.hermes.android.core.model.SessionEventsResult
 import com.hermes.android.core.model.SessionMessagesResult
@@ -56,7 +57,7 @@ class ChatInitializationTest {
             `when`(repo.listSessions()).thenReturn(listOf(SessionSummary("stored", "会话名称")))
             `when`(repo.history("runtime")).thenReturn(SessionMessagesResult())
             `when`(repo.sessionEvents()).thenReturn(SessionEventsResult())
-            `when`(repo.modelOptions()).thenReturn(emptyList())
+            `when`(repo.modelOptions()).thenReturn(ModelOptionsSnapshot(emptyList()))
             `when`(repo.commands()).thenReturn(emptyList())
 
             val vm = ChatViewModel(repo, settings, target, initialTitle)

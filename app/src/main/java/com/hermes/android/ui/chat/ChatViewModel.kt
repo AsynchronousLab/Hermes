@@ -5,9 +5,12 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.hermes.android.core.CommandEntry
 import com.hermes.android.core.HermesRepository
+import com.hermes.android.core.isStaleSession
 import com.hermes.android.core.model.ModelProvider
 import com.hermes.android.core.model.ReasoningLevel
+import com.hermes.android.core.model.SessionCreated
 import com.hermes.android.core.model.SessionInfoPayload
+import com.hermes.android.core.model.SessionMessage
 import com.hermes.android.core.model.Usage
 import com.hermes.android.core.net.HermesHttp
 import com.hermes.android.core.net.RpcConnectionState
@@ -170,7 +173,6 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
             val reasoningWire = runCatching { settings.reasoningLevel.first() }.getOrNull()
             _state.update { it.copy(reasoning = ReasoningLevel.from(reasoningWire)) }
             openSessionWhenConnected()
-            loadAuxiliary()
         }
     }
 
@@ -188,12 +190,15 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
         openJob = viewModelScope.launch {
             repo.connection.first { it == RpcConnectionState.Connected }
             openSession()
+            // Model/command inventories need a live socket. Loading them in the
+            // same coroutine that waited for the link is what fixes a chat that
+            // opened showing "无模型" and a picker with nothing to tap.
+            refreshModels()
+            loadCommands()
         }
     }
 
-    private fun loadAuxiliary() = viewModelScope.launch {
-        runCatching { repo.modelOptions() }
-            .onSuccess { list -> _state.update { s -> s.copy(models = list) } }
+    private fun loadCommands() = viewModelScope.launch {
         runCatching { repo.commands() }
             .onSuccess { list -> _state.update { s -> s.copy(commands = list) } }
     }
@@ -225,6 +230,222 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
                 throw t
             } catch (_: Throwable) {
                 // The visible-screen watchdog will try again on its next tick.
+            }
+        }
+    }
+
+    /**
+     * Loads the model inventory.
+     *
+     * Safe to call repeatedly: the picker triggers it when it opens, so an
+     * inventory that failed while the socket was down is recoverable without
+     * leaving the screen.
+     */
+    fun refreshModels() = viewModelScope.launch {
+        if (_state.value.modelsLoading) return@launch
+        _state.update { it.copy(modelsLoading = true, modelsError = null) }
+        val gen = sessionGeneration
+        val result = runCatching { repo.modelOptions() }
+        if (gen != sessionGeneration) return@launch
+        result.fold(
+            onSuccess = { snap ->
+                _state.update { s ->
+                    s.copy(
+                        models = snap.providers.ifEmpty { s.models },
+                        modelsLoading = false,
+                        // A profile pick beats "nothing selected": the header used
+                        // to say 未选择模型 until the first session.info arrived.
+                        model = s.model ?: snap.model,
+                        provider = s.provider ?: snap.provider,
+                        modelsError = if (snap.providers.isEmpty()) "服务端未返回模型列表" else null,
+                    )
+                }
+            },
+            onFailure = { t ->
+                _state.update { it.copy(modelsLoading = false, modelsError = t.friendly()) }
+            },
+        )
+    }
+
+    /**
+     * Serialises every re-registration of this conversation.
+     *
+     * A socket drop, a stale-id retry and the user's own "new session" can all
+     * land at once; without the lock they raced and the loser overwrote the
+     * winner's runtime id with one the gateway had already reaped.
+     */
+    private val repairMutex = Mutex()
+
+    /**
+     * Brings the conversation back under a fresh runtime id.
+     *
+     * Called after a socket drop and whenever a session-scoped RPC answers
+     * 4001/4007 — the runtime id is detached on disconnect and orphan-reaped
+     * about 20 seconds later, so the id we hold is simply gone while the stored
+     * transcript is not. Resuming the durable id is the documented recovery.
+     */
+    private suspend fun repairSession(failedSid: String? = null): String? = repairMutex.withLock {
+        val st = _state.value
+        val current = st.sessionId
+        // Someone else already repaired it while we waited for the lock.
+        if (failedSid != null && current != null && current != failedSid) return@withLock current
+
+        val stored = st.storedSessionId
+        if (stored.isNullOrBlank()) {
+            // Never persisted: the gateway creates the DB row on the first
+            // prompt, so a session that was never spoken to has nothing to
+            // resume. Re-mint one and keep whatever is on screen.
+            if (st.messages.any { it.role == ChatMessage.Role.User && it.delivered }) {
+                // Something WAS sent, so this is not an empty draft. Silently
+                // minting a new session would look like the context survived
+                // when it did not — say so instead.
+                _state.update {
+                    it.copy(streaming = false, error = "会话已在服务端结束且没有可恢复的记录，请新建会话")
+                }
+                return@withLock null
+            }
+            val gen = sessionGeneration
+            val fresh = runCatching { repo.createSession() }.getOrElse { t ->
+                _state.update { it.copy(error = "会话已失效，且无法新建：${t.friendly()}") }
+                return@withLock null
+            }
+            if (gen != sessionGeneration) return@withLock null
+            bindIdentity(fresh)
+            return@withLock fresh.sessionId
+        }
+
+        val gen = sessionGeneration
+        val r = runCatching { repo.resumeSession(stored) }.getOrElse { t ->
+            _state.update {
+                it.copy(
+                    streaming = false,
+                    error = if (t.isStaleSession()) {
+                        "会话已在服务端结束（$stored 不存在），请返回列表重新打开或新建会话"
+                    } else {
+                        "恢复会话失败：${t.friendly()}"
+                    },
+                )
+            }
+            return@withLock null
+        }
+        if (gen != sessionGeneration) return@withLock null
+        bindIdentity(r)
+        applyResume(r)
+        r.sessionId
+    }
+
+    /** Re-attach after a reconnect, keeping the transcript already on screen. */
+    private suspend fun reattach(): Boolean = repairSession(failedSid = null) != null
+
+    /**
+     * Runs [block] against a live runtime id, repairing once when the gateway
+     * says the id is stale.
+     *
+     * This is what stops a message typed after a drop from being rejected with
+     * "session not found" — the prompt used to be lost and only a red banner
+     * remained.
+     */
+    private suspend fun <T> onLiveSession(block: suspend (String) -> T): T {
+        val sid = _state.value.sessionId
+            ?: throw RpcFailure.NotConnected("*")
+        return try {
+            block(sid)
+        } catch (t: Throwable) {
+            if (!t.isStaleSession()) throw t
+            val fresh = repairSession(failedSid = sid)
+            if (fresh == null || fresh == sid) throw t
+            block(fresh)
+        }
+    }
+
+    /**
+     * Applies a resume/reattach reply: transcript plus the still-running flag.
+     *
+     * Runs entirely in memory on purpose — a repair already holds [repairMutex],
+     * and `loadHistory` may ask for another repair, which would deadlock.
+     */
+    private fun applyResume(r: SessionCreated) {
+        val inline = r.messages
+        if (inline != null && (inline.isNotEmpty() || (r.messageCount ?: 0) == 0)) {
+            applyHistory(inline)
+        }
+        r.info?.model?.takeIf { it.isNotBlank() }?.let { m -> _state.update { it.copy(model = m) } }
+        r.info?.provider?.takeIf { it.isNotBlank() }?.let { p -> _state.update { it.copy(provider = p) } }
+        if (r.running == true) {
+            // A turn survived the gap: keep the typing affordance instead of
+            // showing an idle chat that will suddenly grow text.
+            segmentOpen = true
+            _state.update { s ->
+                s.copy(
+                    streaming = true,
+                    messages = if (s.messages.any { it.streaming }) s.messages
+                    else s.messages + ChatMessage(
+                        key = nextKey++,
+                        role = ChatMessage.Role.Assistant,
+                        text = "",
+                        streaming = true,
+                    ),
+                )
+            }
+        }
+    }
+
+    /** Replaces delivered rows with server rows, keeping local-only ones. */
+    private fun applyHistory(rows: List<com.hermes.android.core.model.SessionMessage>) {
+        val mapped = rows.map { m ->
+            ChatMessage(
+                key = nextKey++,
+                role = when {
+                    m.isUser -> ChatMessage.Role.User
+                    m.isSystem -> ChatMessage.Role.System
+                    else -> ChatMessage.Role.Assistant
+                },
+                text = m.body,
+                reasoning = m.reasoning.orEmpty(),
+                timestamp = ((m.timestamp ?: 0.0) * 1000).toLong(),
+            )
+        }
+        transcriptRevision++
+        _state.update { s -> s.copy(messages = mergeHistorySnapshot(mapped, s.messages)) }
+    }
+
+    /**
+     * Rebinds the identity of the *same* conversation after a resume.
+     *
+     * Deliberately does not touch [sessionGeneration] or the transcript: this is
+     * the same chat on a new transport, not a session switch.
+     */
+    private fun bindIdentity(created: SessionCreated) {
+        val previous = _state.value.sessionId
+        val stored = created.durableId
+        _state.update {
+            it.copy(
+                sessionId = created.sessionId,
+                storedSessionId = stored ?: it.storedSessionId,
+            )
+        }
+        // A staged send captured the old runtime id; leaving it behind made the
+        // "retry" button a no-op after a repair.
+        if (previous != null && previous != created.sessionId) {
+            sendBuffer.replaceAll { _, item ->
+                if (item.sessionId == previous) item.copy(sessionId = created.sessionId) else item
+            }
+        }
+        rememberDurable(created)
+    }
+
+    private fun rememberDurable(created: SessionCreated) {
+        val stored = created.durableId ?: return
+        viewModelScope.launch { settings.rememberSession(created.sessionId, stored) }
+    }
+
+    /** Records the branch parent so the header can offer a jump to it. */
+    private fun loadParentLink(stored: String?) {
+        if (stored.isNullOrBlank()) return
+        viewModelScope.launch {
+            val parent = runCatching { repo.sessionDetail(stored).parentSessionId }.getOrNull()
+            if (!parent.isNullOrBlank()) {
+                _state.update { if (it.storedSessionId == stored) it.copy(parentSessionId = parent) else it }
             }
         }
     }
@@ -269,8 +490,16 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
                 messages = s.messages.map { if (it.streaming) it.copy(streaming = false) else it },
             )
         }
-        recoverOpenRequests(sid)
-        scheduleHistoryRecovery(sid)
+        // A new socket is a NEW transport: the gateway still holds the session
+        // on the dead one, so a turn's events would be published into the void —
+        // and its runtime id is orphan-reaped about 20 seconds after the drop.
+        // Re-attach first, then recover against whatever id the resume returned.
+        viewModelScope.launch {
+            reattach()
+            val live = _state.value.sessionId ?: return@launch
+            recoverOpenRequests(live)
+            scheduleHistoryRecovery(live)
+        }
     }
 
     private fun scheduleHistoryRecovery(sid: String) {
@@ -317,37 +546,50 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
                     val name = profileName.orEmpty()
                     val c = repo.createSession(name)
                     boundProfile = name.takeIf { it.isNotBlank() }
-                    bindSession(c.sessionId, c.storedSessionId, name)
-                    settings.rememberSession(c.sessionId, c.storedSessionId)
+                    bindSession(c, title = name.ifBlank { "会话" })
+                    settings.rememberSession(c.sessionId, c.durableId)
                 }
 
                 Target.STORED -> {
                     val r = repo.resumeSession(id.orEmpty())
-                    val title = initialTitle?.takeIf { it.isNotBlank() } ?: "未命名会话"
-                    bindSession(r.sessionId, r.storedSessionId, title)
-                    settings.rememberSession(r.sessionId, r.storedSessionId)
+                    val title = initialTitle?.takeIf { it.isNotBlank() }
+                        ?: r.info?.profileName?.takeIf { it.isNotBlank() }
+                        ?: "未命名会话"
+                    bindSession(r, title)
+                    settings.rememberSession(r.sessionId, r.durableId)
                     if (initialTitle.isNullOrBlank()) refreshStoredTitle(id.orEmpty(), r.sessionId)
-                    loadHistory(r.sessionId)
+                    // Resume already carries the transcript; only fall back to a
+                    // history read when the gateway sent none.
+                    if (r.messages.isNullOrEmpty()) loadHistory(r.sessionId) else applyResume(r)
                 }
 
                 Target.RUNTIME -> {
                     // A live session id from a session we just created: bind to
-                    // it directly rather than creating another one.
+                    // it directly rather than creating another one. It has no
+                    // known durable id, so a reconnect must re-create it.
                     boundProfile = null
                     val runtime = id.orEmpty()
-                    bindSession(runtime, null, "新会话")
+                    bindSession(
+                        SessionCreated(sessionId = runtime),
+                        title = "新会话",
+                    )
                     loadHistory(runtime)
                 }
 
                 Target.NEW -> {
                     boundProfile = null
                     val c = repo.createSession()
-                    bindSession(c.sessionId, c.storedSessionId, "新会话")
-                    settings.rememberSession(c.sessionId, c.storedSessionId)
+                    bindSession(c, title = "新会话")
+                    settings.rememberSession(c.sessionId, c.durableId)
                 }
             }
         } catch (t: Throwable) {
-            _state.update { it.copy(loading = false, error = t.friendly()) }
+            val reason = if (t.isStaleSession()) {
+                "该会话不存在或已被服务端清理，请返回列表刷新后重试"
+            } else {
+                t.friendly()
+            }
+            _state.update { it.copy(loading = false, error = reason) }
             return
         }
         _state.update { it.copy(loading = false) }
@@ -381,7 +623,7 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
                     isCurrent = { gen == sessionGeneration && _state.value.sessionId == sessionId && repo.isConnected },
                     revision = { transcriptRevision },
                     canRead = { pendingSendKeys.isEmpty() },
-                    read = { repo.history(sessionId) },
+                    read = { onLiveSession { repo.history(it) } },
                 ) ?: return@withLock false
                 val rows = res.messages.map { m ->
                     ChatMessage(
@@ -417,7 +659,7 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
         }
     }
 
-    private fun bindSession(sessionId: String, stored: String?, title: String) {
+    private fun bindSession(created: SessionCreated, title: String) {
         sessionGeneration++
         historyRecoveryJob?.cancel()
         requestRecoveryJob?.cancel()
@@ -430,26 +672,35 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
         _state.update {
             // Reset every session-scoped field: carrying messages or a pending
             // approval across a switch showed the previous chat's content.
-            // `loading` must be false — the state is already usable, and leaving
-            // it at its `true` default left the chat stuck on a spinner after
-            // an in-place "new session" or "fork".
             ChatUiState(
-                sessionId = sessionId,
-                storedSessionId = stored,
+                sessionId = created.sessionId,
+                storedSessionId = created.durableId,
                 title = title,
                 loading = false,
                 models = it.models,
+                modelsLoading = it.modelsLoading,
+                modelsError = it.modelsError,
                 commands = it.commands,
                 connection = it.connection,
                 reasoning = it.reasoning,
                 speakReplies = it.speakReplies,
+                model = it.model,
+                provider = it.provider,
             )
         }
+        created.info?.model?.takeIf { it.isNotBlank() }?.let { m ->
+            _state.update { it.copy(model = m) }
+        }
+        created.info?.provider?.takeIf { it.isNotBlank() }?.let { p ->
+            _state.update { it.copy(provider = p) }
+        }
+        rememberDurable(created)
         // The binding now exists, so the held events can finally be filtered
         // and applied. Re-entrant safe: handleEvent no longer buffers once
         // `sessionId` is set.
         while (preBindEvents.isNotEmpty()) handleEvent(preBindEvents.removeFirst())
-        recoverOpenRequests(sessionId)
+        recoverOpenRequests(created.sessionId)
+        loadParentLink(created.durableId)
     }
 
     // ------------------------------------------------------------- streaming ---
@@ -756,7 +1007,7 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
         val trimmed = text.trim()
         val pending = _state.value.pending
         if (trimmed.startsWith("/")) {
-            runSlash(sid, trimmed)
+            runSlash(trimmed)
             return true
         }
         if (trimmed.isEmpty() && pending.isEmpty()) return false
@@ -811,7 +1062,22 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
             val gen = sessionGeneration
             try {
                 val item = sendBuffer[key] ?: return@launch
-                val failures = uploadBuffered(key, item)
+                // Both calls are session-scoped. A runtime id that was reaped
+                // while the message sat buffered failed here and the prompt was
+                // lost, so repair first and then work against the fresh id.
+                val failures = runCatching {
+                    onLiveSession { sid -> uploadBuffered(key, item, sid) }
+                }.getOrElse { t ->
+                    if (t is CancellationException) throw t
+                    _state.update { s -> s.copy(
+                        error = t.friendly(),
+                        streaming = false,
+                        messages = s.messages.map { m ->
+                            if (m.key == key) m.copy(sending = false) else m
+                        },
+                    ) }
+                    return@launch
+                }
                 if (gen != sessionGeneration) return@launch
                 if (failures.isNotEmpty()) {
                     _state.update { s -> s.copy(
@@ -820,7 +1086,7 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
                     ) }
                     return@launch
                 }
-                runCatching { repo.submitPrompt(item.sessionId, item.composed) }.fold(
+                runCatching { onLiveSession { sid -> repo.submitPrompt(sid, item.composed) } }.fold(
                     onSuccess = {
                         if (gen != sessionGeneration) return@fold
                         sendBuffer.remove(key)
@@ -859,7 +1125,11 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
         }
     }
 
-    private suspend fun uploadBuffered(key: Long, item: BufferedSend): List<String> {
+    private suspend fun uploadBuffered(
+        key: Long,
+        item: BufferedSend,
+        sessionId: String = item.sessionId,
+    ): List<String> {
         val pending = item.attachments
         if (pending.isEmpty()) return emptyList()
         _state.update { it.copy(uploading = true) }
@@ -875,7 +1145,7 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
                 AttachmentRef.Kind.FILE -> com.hermes.android.core.AttachmentKind.FILE
             }
             val result = runCatching {
-                repo.attach(item.sessionId, a.name, kind, a.mime, a.base64)
+                repo.attach(sessionId, a.name, kind, a.mime, a.base64)
             }
             result.onSuccess { uploadedIds.add(a.id) }
                 .onFailure { e ->
@@ -885,8 +1155,10 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
         }
         // Keep the whole captured batch until the prompt is accepted. A retry
         // uploads only the files that did not land in earlier attempts.
-        if (sendBuffer[key] === item) {
-            sendBuffer[key] = item.copy(attachments = pending.map { att ->
+        // Update by key, not by identity: a repair may have retargeted this
+        // entry to a fresh runtime id while the bytes were uploading.
+        sendBuffer[key]?.let { current ->
+            sendBuffer[key] = current.copy(attachments = current.attachments.map { att ->
                 if (att.id in uploadedIds) att.copy(uploaded = true) else att
             })
             _state.update { it.copy(uploading = false) }
@@ -944,7 +1216,7 @@ fun addAttachments(items: List<PendingAttachment>) {
 
     fun nextAttachmentId(): Long = nextAttachId++
 
-    private fun runSlash(sid: String, command: String) {
+    private fun runSlash(command: String) {
         _state.update {
             it.copy(
                 messages = it.messages + ChatMessage(
@@ -963,7 +1235,7 @@ fun addAttachments(items: List<PendingAttachment>) {
             // Capture the generation: a slash command can still be in flight when
             // the user switches session, and its output must not land in the new one.
             val gen = sessionGeneration
-            runCatching { repo.slash(sid, command) }.fold(
+            runCatching { onLiveSession { sid -> repo.slash(sid, command) } }.fold(
                 onSuccess = { res ->
                     if (gen != sessionGeneration) return@fold
                     _state.update {
@@ -977,37 +1249,43 @@ fun addAttachments(items: List<PendingAttachment>) {
                         )
                     }
                 },
-                onFailure = { t -> _state.update { it.copy(error = t.friendly()) } },
+                onFailure = { t ->
+                    if (gen == sessionGeneration) _state.update { it.copy(error = t.friendly()) }
+                },
             )
         }
     }
 
     fun insertCommand(name: String) {
-        val sid = _state.value.sessionId ?: return
-        runSlash(sid, name)
+        if (_state.value.sessionId == null) return
+        runSlash(name)
     }
 
     // ------------------------------------------------------------- controls ---
 
     fun selectModel(provider: ModelProvider, model: String) = viewModelScope.launch {
-        val sid = _state.value.sessionId ?: return@launch
         val gen = sessionGeneration
         _state.update { it.copy(notice = "正在切换模型…") }
-        runCatching { repo.switchModel(sid, model, provider.slug) }.fold(
-            onSuccess = {
+        runCatching { onLiveSession { sid -> repo.switchModel(sid, model, provider.slug) } }.fold(
+            onSuccess = { res ->
                 if (gen != sessionGeneration) return@fold
-                _state.update { it.copy(model = model, provider = provider.slug, notice = "已切换到 $model") }
+                _state.update {
+                    it.copy(
+                        model = model,
+                        provider = provider.slug,
+                        notice = res.output.ifBlank { "已切换到 $model" },
+                    )
+                }
             },
             onFailure = { t -> _state.update { it.copy(error = t.friendly()) } },
         )
     }
 
     fun selectReasoning(level: ReasoningLevel) = viewModelScope.launch {
-        val sid = _state.value.sessionId ?: return@launch
         val gen = sessionGeneration
         settings.setReasoning(level.wire)
         _state.update { it.copy(reasoning = level) }
-        runCatching { repo.setReasoning(sid, level) }.onFailure { t ->
+        runCatching { onLiveSession { sid -> repo.setReasoning(sid, level) } }.onFailure { t ->
             if (gen == sessionGeneration) _state.update { it.copy(error = t.friendly()) }
         }
     }
@@ -1095,7 +1373,10 @@ fun respondToRequest(request: ServerRequest, choice: String) = viewModelScope.la
 
         _state.update { it.copy(notice = "正在创建分支…") }
         val gen = sessionGeneration
-        runCatching { repo.forkSessionFrom(sid, prefix, boundProfile) }.fold(
+        // Link the branch to the DURABLE parent: a runtime id dies with the
+        // socket, and the branch would then point at nothing.
+        val parent = _state.value.storedSessionId ?: sid
+        runCatching { repo.forkSessionFrom(parent, prefix, boundProfile) }.fold(
             onSuccess = { c ->
                 if (gen != sessionGeneration) return@fold
                 // Move to the branch rather than leaving the user in the old
@@ -1104,11 +1385,15 @@ fun respondToRequest(request: ServerRequest, choice: String) = viewModelScope.la
                 // pointing the resume pointer at it is self-consistent, whereas
                 // not switching while rewriting the pointer made the next
                 // launch resume a session the user had left.
-                settings.rememberSession(c.sessionId, c.storedSessionId)
-                bindSession(c.sessionId, c.storedSessionId, "${_state.value.title} · 分支")
+                bindSession(c, title = "${_state.value.title} · 分支")
                 // The branch exists either way, but claiming success over an
                 // empty transcript hides a load failure behind a cheerful toast.
-                val loaded = loadHistory(c.sessionId)
+                val seeded = c.messages?.takeIf { it.isNotEmpty() }
+                val loaded = if (seeded != null) {
+                    applyHistory(seeded); true
+                } else {
+                    loadHistory(c.sessionId)
+                }
                 _state.update {
                     if (it.sessionId != c.sessionId) it
                     else if (loaded) it.copy(notice = "已从此处创建分支会话")
@@ -1133,8 +1418,7 @@ fun respondToRequest(request: ServerRequest, choice: String) = viewModelScope.la
                 // Same late-response race as fork(): a session switch that
                 // started after this one must not be overwritten.
                 if (gen != sessionGeneration) return@fold
-                bindSession(c.sessionId, c.storedSessionId, "新会话")
-                settings.rememberSession(c.sessionId, c.storedSessionId)
+                bindSession(c, title = "新会话")
             },
             onFailure = { t -> _state.update { it.copy(error = t.friendly()) } },
         )

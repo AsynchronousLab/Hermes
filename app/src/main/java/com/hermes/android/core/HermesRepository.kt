@@ -7,6 +7,7 @@ import com.hermes.android.core.net.HermesHttp
 import com.hermes.android.core.net.HermesProxySelector
 import com.hermes.android.core.net.HermesRest
 import com.hermes.android.core.net.JsonRpcClient
+import com.hermes.android.core.net.RpcFailure
 import com.hermes.android.core.net.SessionCookieJar
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -15,6 +16,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -330,14 +333,16 @@ class HermesRepository {
         )
 
     /** `session.resume` wants the durable (stored) id, not the short runtime one. */
-    suspend fun resumeSession(storedSessionId: String): SessionCreated =
+    suspend fun resumeSession(storedSessionId: String, profile: String? = null): SessionCreated =
         rpc.rpc(
             "session.resume",
             buildJsonObject {
                 put("session_id", storedSessionId)
                 put("source", ANDROID_SESSION_SOURCE)
+                if (!profile.isNullOrBlank()) put("profile", profile)
             },
             SessionCreated.serializer(),
+            timeoutMs = 60_000,
         )
 
     /**
@@ -481,8 +486,34 @@ class HermesRepository {
 
     // -------------------------------------------------------------- models ---
 
-    suspend fun modelOptions(): List<ModelProvider> =
-        rpc.rpc("model.options", JsonObject(emptyMap()), ModelOptionsResult.serializer()).providers
+    /**
+     * Provider → model inventory for the picker.
+     *
+     * `model.options` over RPC is the primary source, but it is a
+     * session-scoped-ish call that fails while the socket is still coming up —
+     * which is exactly when the chat screen asks for it, leaving the picker
+     * permanently empty. The dashboard's REST twin answers as soon as a cookie
+     * exists, so it backs the RPC up instead of showing "0 个模型".
+     */
+    suspend fun modelOptions(): ModelOptionsSnapshot {
+        val viaRpc = runCatching {
+            rpc.rpc("model.options", JsonObject(emptyMap()), ModelOptionsResult.serializer())
+        }.getOrNull()
+        if (viaRpc != null && viaRpc.providers.isNotEmpty()) {
+            return ModelOptionsSnapshot(viaRpc.providers, viaRpc.model, viaRpc.provider)
+        }
+        val viaRest = runCatching {
+            HermesHttp.json.decodeFromJsonElement(
+                ModelOptionsResult.serializer(),
+                rest.getJson("/api/model/options"),
+            )
+        }.getOrNull()
+        return ModelOptionsSnapshot(
+            providers = viaRest?.providers ?: viaRpc?.providers ?: emptyList(),
+            model = viaRest?.model ?: viaRpc?.model,
+            provider = viaRest?.provider ?: viaRpc?.provider,
+        )
+    }
 
     suspend fun modelInfo(): ModelInfo = rest.getJson("/api/model/info")
         .let { HermesHttp.json.decodeFromJsonElement(ModelInfo.serializer(), it) }
@@ -490,10 +521,40 @@ class HermesRepository {
     /**
      * Switch model for this session.
      *
-     * The gateway exposes model control as a slash command rather than a
-     * dedicated RPC method: `/model [model] [--provider name]`.
+     * The dashboard does not use a slash command for this: it writes
+     * `config.set {key:"model", value:"<model> --session [--provider p]"}`,
+     * which is the only path that reports `confirm_required` for an expensive
+     * model. `/model …` stays as the fallback for older gateways.
      */
     suspend fun switchModel(sessionId: String, model: String, provider: String?): SlashExecResult {
+        val value = buildString {
+            append(model)
+            append(" --session")
+            if (!provider.isNullOrBlank()) append(" --provider ").append(provider)
+        }
+        val viaConfig = runCatching {
+            rpc.rpcRaw(
+                "config.set",
+                buildJsonObject {
+                    put("session_id", sessionId)
+                    put("key", "model")
+                    put("value", value)
+                },
+                timeoutMs = 60_000,
+            )
+        }
+        val body = viaConfig.getOrNull()
+        if (body != null) {
+            if (body["confirm_required"]?.let { it is JsonPrimitive && it.booleanOrNull == true } == true) {
+                throw IllegalStateException(
+                    body["confirm_message"]?.let { (it as? JsonPrimitive)?.content }
+                        ?: "该模型费用较高，需要确认后才能切换",
+                )
+            }
+            val warning = (body["warning"] as? JsonPrimitive)?.content?.takeIf { it.isNotBlank() }
+            return SlashExecResult(output = warning ?: "已切换到 $model")
+        }
+        // Unknown method / older gateway: fall back to the slash command.
         val cmd = buildString {
             append("/model ").append(model)
             if (!provider.isNullOrBlank()) append(" --provider ").append(provider)
@@ -755,6 +816,30 @@ class HermesRepository {
 }
 
 data class CommandEntry(val name: String, val description: String)
+
+/**
+ * Providers plus the profile's current pick.
+ *
+ * The pick is threaded through so the chat header can name a model before the
+ * first `session.info` event ever arrives — otherwise a freshly opened chat
+ * said "未选择模型" while the picker was fully populated.
+ */
+data class ModelOptionsSnapshot(
+    val providers: List<ModelProvider>,
+    val model: String? = null,
+    val provider: String? = null,
+)
+
+/**
+ * True when the gateway no longer holds the runtime session id we sent.
+ *
+ * 4001 is what a session-scoped RPC answers for a runtime id that was detached
+ * on a socket drop and then orphan-reaped (grace: 20s); 4007 is `session not
+ * found` from a resume. Both mean "resume the stored id and retry", not "this
+ * conversation is gone" — the stored transcript is still on disk.
+ */
+fun Throwable.isStaleSession(): Boolean =
+    this is RpcFailure.Rpc && (code == 4001 || code == 4007)
 
 /**
  * The next `groups.list` page offset, or null when the walk should stop.

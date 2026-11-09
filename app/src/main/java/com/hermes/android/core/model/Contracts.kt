@@ -43,8 +43,19 @@ data class SessionSummary(
     @SerialName("started_at") val startedAt: Double? = null,
     @SerialName("message_count") val messageCount: Int? = null,
     val source: String? = null,
+    /**
+     * Tip of a compression lineage.
+     *
+     * A session that was compressed leaves its old row behind; `resume` must
+     * target the tip or the client re-opens the pre-compression half of the
+     * conversation. Present only when the row is part of such a lineage.
+     */
+    @SerialName("resolved_id") val resolvedId: String? = null,
 ) {
     val displayTitle: String get() = title?.takeIf { it.isNotBlank() } ?: "未命名会话"
+
+    /** Durable id every resume/delete call must use. */
+    val durableId: String get() = resolvedId?.takeIf { it.isNotBlank() } ?: id
 }
 
 /** Full session record from `GET /api/sessions/{id}`. */
@@ -62,14 +73,37 @@ data class SessionDetail(
     @SerialName("end_reason") val endReason: String? = null,
 )
 
-/** Result of `session.create`. */
+/**
+ * Result of `session.create` / `session.resume` / `session.branch`.
+ *
+ * The two calls do **not** agree on the field that carries the durable id:
+ * `session.create` answers `stored_session_id`, a cold `session.resume` answers
+ * `session_key`, and a warm reattach answers `stored_session_id` again. Reading
+ * only the first one left [storedSessionId] null after most resumes, so the app
+ * forgot which stored session it was showing and could not recover it after a
+ * reconnect.
+ */
 @Serializable
 data class SessionCreated(
     @SerialName("session_id") val sessionId: String,
     @SerialName("stored_session_id") val storedSessionId: String? = null,
+    @SerialName("session_key") val sessionKey: String? = null,
     @SerialName("message_count") val messageCount: Int? = null,
-    val info: JsonObject? = null,
-)
+    val info: SessionInfoPayload? = null,
+    /** Inline transcript — resume returns it, so opening a chat needs one round-trip. */
+    val messages: List<SessionMessage>? = null,
+    /** True when a turn is still running server-side (the socket dropped mid-answer). */
+    val running: Boolean? = null,
+    val status: String? = null,
+    /** The stored id the gateway actually resumed (differs when a title was passed). */
+    val resumed: String? = null,
+) {
+    /** Durable id, whichever spelling the server used. */
+    val durableId: String?
+        get() = storedSessionId?.takeIf { it.isNotBlank() }
+            ?: sessionKey?.takeIf { it.isNotBlank() }
+            ?: resumed?.takeIf { it.isNotBlank() }
+}
 
 @Serializable
 data class SessionInfo(
@@ -126,6 +160,7 @@ data class SessionMessage(
 data class SessionInfoPayload(
     val model: String? = null,
     val provider: String? = null,
+    @SerialName("profile_name") val profileName: String? = null,
     @SerialName("reasoning_effort") val reasoningEffort: String? = null,
     @SerialName("reasoning_effort_wire") val reasoningEffortWire: String? = null,
     @SerialName("service_tier") val serviceTier: String? = null,
@@ -176,7 +211,12 @@ data class ModelProvider(
 )
 
 @Serializable
-data class ModelOptionsResult(val providers: List<ModelProvider> = emptyList())
+data class ModelOptionsResult(
+    val providers: List<ModelProvider> = emptyList(),
+    /** Current pick for the asking profile — the only place it is known before a turn. */
+    val model: String? = null,
+    val provider: String? = null,
+)
 
 @Serializable
 data class ModelInfo(

@@ -25,6 +25,9 @@ fun ModelPickerSheet(
     providers: List<ModelProvider>,
     current: String?,
     currentProvider: String?,
+    loading: Boolean = false,
+    error: String? = null,
+    onReload: () -> Unit = {},
     onPick: (ModelProvider, String) -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -32,13 +35,42 @@ fun ModelPickerSheet(
 
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
-            Text("选择模型", style = MaterialTheme.typography.titleMedium)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("选择模型", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+                TextButton(onClick = onReload, enabled = !loading) {
+                    Text(if (loading) "加载中…" else "刷新")
+                }
+            }
             Text(
-                "${providers.sumOf { it.totalModels }} 个模型 · ${providers.size} 个供应商",
+                when {
+                    loading && providers.isEmpty() -> "正在读取模型列表…"
+                    providers.isEmpty() -> "还没有拿到模型列表"
+                    else -> "${providers.sumOf { it.totalModels }} 个模型 · ${providers.size} 个供应商"
+                },
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(bottom = 8.dp),
             )
+            // An empty picker used to be a dead end: no rows, no reload, and no
+            // hint that the list had simply failed to load while the socket was
+            // still coming up.
+            if (providers.isEmpty()) {
+                if (loading) {
+                    Box(Modifier.fillMaxWidth().padding(vertical = 24.dp), Alignment.Center) {
+                        CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
+                    }
+                } else {
+                    Text(
+                        error ?: "点右上角「刷新」重新拉取",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.padding(vertical = 8.dp),
+                    )
+                    Button(onClick = onReload, modifier = Modifier.padding(bottom = 16.dp)) {
+                        Text("重新加载")
+                    }
+                }
+            }
         }
         LazyColumn(Modifier.fillMaxWidth().heightIn(max = 480.dp)) {
             providers.forEach { p ->
