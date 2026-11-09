@@ -26,6 +26,9 @@ t3.bin
 __pycache__/
 *.py[cod]
 
+# Agent workspace state (memory logs, local scratch) — never part of the app
+.workbuddy/
+
 # IDE
 .idea/
 *.iml
