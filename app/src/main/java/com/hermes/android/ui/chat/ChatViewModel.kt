@@ -19,6 +19,7 @@ import com.hermes.android.core.net.RpcFailure
 import com.hermes.android.core.store.SettingsStore
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -159,7 +160,13 @@ private fun parseTarget(raw: String?): Triple<Target, String?, String?> {
 
     init {
         observeConnection()
-        observeEvents()
+        // Posted rather than called: `repo.events` replays buffered frames
+        // synchronously inside `collect` on Main.immediate, so collecting from
+        // the constructor ran `handleEvent` before every field declared below
+        // this block was initialised — that is a NullPointerException on
+        // `preBindEvents`, and it looked like "tapping any session crashes".
+        // Dispatching without `immediate` guarantees the object is constructed.
+        viewModelScope.launch(Dispatchers.Main) { observeEvents() }
         viewModelScope.launch {
             var seen = repo.rpc.eventLossVersion.value
             repo.rpc.eventLossVersion.collect { version ->

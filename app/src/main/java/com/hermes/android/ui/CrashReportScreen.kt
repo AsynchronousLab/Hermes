@@ -19,10 +19,13 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.hermes.android.core.buildInfo
+import com.hermes.android.core.summary
 
 /**
  * The stack trace of the previous run's crash.
@@ -33,6 +36,7 @@ import androidx.compose.ui.unit.sp
 @Composable
 fun CrashReportScreen(text: String, onDismiss: () -> Unit) {
     val clipboard = LocalClipboardManager.current
+    val build = com.hermes.android.core.buildInfo(LocalContext.current).summary()
     Scaffold { pad ->
         Column(
             Modifier
@@ -42,6 +46,7 @@ fun CrashReportScreen(text: String, onDismiss: () -> Unit) {
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             Text("上次运行时崩溃了", style = MaterialTheme.typography.titleMedium)
+            Text(build, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
             Text(
                 "下面是崩溃堆栈。复制后发给开发者即可定位；点「继续使用」会清掉这条记录。",
                 style = MaterialTheme.typography.bodySmall,
@@ -66,7 +71,7 @@ fun CrashReportScreen(text: String, onDismiss: () -> Unit) {
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(
-                    onClick = { clipboard.setText(AnnotatedString(text)) },
+                    onClick = { clipboard.setText(AnnotatedString("$build\n\n$text")) },
                     modifier = Modifier.weight(1f),
                 ) { Text("复制堆栈") }
                 OutlinedButton(onClick = onDismiss, modifier = Modifier.weight(1f)) {

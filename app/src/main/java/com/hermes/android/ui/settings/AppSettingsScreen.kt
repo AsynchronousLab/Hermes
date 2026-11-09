@@ -14,6 +14,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.platform.LocalContext
+import com.hermes.android.core.buildInfo
+import com.hermes.android.core.summary
 import com.hermes.android.core.net.HermesProxy
 import com.hermes.android.core.net.ProxyType
 import com.hermes.android.core.store.AppAppearance
@@ -84,6 +87,14 @@ fun AppSettingsScreen(
                     Text("你好，这里是 Hermes。字号设置会应用到消息和其他页面。")
                 }
             }
+            // 装的是哪一版，吵架时只看这一行。
+            val context = LocalContext.current
+            Text(
+                buildInfo(context).summary(),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.outline,
+                modifier = Modifier.padding(top = 14.dp),
+            )
         }
     }
 }

@@ -62,7 +62,7 @@
         - name: Create the CNB Release
           type: git:release
           options:
-            title: Hermes Android 0.1.7-debug
+            title: Hermes Android 0.1.8-debug
             preRelease: false
             latest: true
             descriptionFromFile: RELEASE_NOTES.md
